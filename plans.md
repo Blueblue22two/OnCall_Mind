@@ -651,12 +651,233 @@ Phase 3：RAGAs 评估（问题三）
 "datasets>=2.0.0"         # RAGAs 依赖
 ```
 
+## 附录：BM25 增量更新问题及缓解方案
+
+### 问题根源
+
+`BM25EmbeddingFunction`（pymilvus.model.sparse）采用经典 BM25 统计模型：
+
+```
+IDF(t) = log((N - df(t) + 0.5) / (df(t) + 0.5))
+```
+
+其中 `df(t)` 是包含词 `t` 的文档数，`N` 是语料总文档数。这两个值是**全局统计量**，新增/删除任何文档都会改变它们，导致已入库的稀疏向量与当前 BM25 模型不一致——必须重新 `fit()` + 重新 `encode_documents()` + 重新写入 Milvus。
+
+### 项目特点分析
+
+- **当前语料规模**：5 个 aiops-docs Markdown 文件，分割后约 20-50 个 chunk，总量极小
+- **更新频率**：知识库文档属于低频更新（预计每月数次）
+- **Milvus 已存 `content` 字段**：`biz_enhanced` collection 中每条记录已有完整文本，可直接从 Milvus 重建语料，无需额外存储
+
+### 方案一：从 Milvus content 字段重建语料（推荐，当前规模下最简单）
+
+**核心思路**：每次有文档更新时，从 Milvus `biz_enhanced` collection 查询所有 `content` 字段，重建全量语料后再 refit BM25。
+
+```python
+def rebuild_bm25_from_milvus(collection: Collection) -> BM25EmbeddingFunction:
+    # 1. 从 Milvus 查询所有文档文本
+    results = collection.query(
+        expr="id != ''",          # 匹配所有记录
+        output_fields=["content"],
+        limit=65535,              # Milvus 单次 query 上限
+    )
+    corpus = [r["content"] for r in results]
+
+    # 2. 重新拟合 BM25
+    bm25 = BM25EmbeddingFunction()
+    bm25.fit(corpus)
+
+    # 3. 序列化保存
+    bm25.save("data/bm25_model.pkl")
+    return bm25
+```
+
+**与 `VectorIndexService.index_single_file()` 的集成点**：
+
+```
+删除旧 chunks（delete_by_source）
+  → 插入新 chunks（dense + sparse 向量）
+  → 调用 rebuild_bm25_from_milvus()  ← 新增步骤
+  → 更新全局 bm25 单例
+```
+
+**适用条件**：语料 ≤ 10 万 chunk；当前项目语料极小，全量 refit 耗时 < 1 秒，可同步执行。
+
+---
+
+### 方案二：批量延迟 Refit 策略（适合中等更新频率）
+
+不在每次单文件更新时触发 refit，而是积累一批后统一处理，降低 refit 频率：
+
+**子策略 A：N 次更新后触发**
+
+```python
+class BM25Manager:
+    def __init__(self, refit_every: int = 5):
+        self._dirty_count = 0
+        self._refit_every = refit_every
+
+    def on_document_updated(self):
+        self._dirty_count += 1
+        if self._dirty_count >= self._refit_every:
+            self.refit()
+            self._dirty_count = 0
+```
+
+**子策略 B：定时任务触发**
+
+使用 APScheduler 或 FastAPI lifespan 定时任务，每小时/每天执行一次 refit：
+
+```python
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+scheduler = AsyncIOScheduler()
+scheduler.add_job(rebuild_bm25_from_milvus, "cron", hour=3)  # 每天凌晨 3 点
+scheduler.start()
+```
+
+**子策略 C：首次检索触发（Lazy Refit）**
+
+设置 `_is_dirty` 标志，在下一次 `EnhancedRAGRetriever.retrieve()` 调用时检测并按需 refit：
+
+```python
+async def retrieve(self, query: str, top_k: int) -> list[Document]:
+    if self.bm25_manager.is_dirty:
+        await self.bm25_manager.refit()   # 异步重建，避免阻塞主线程
+    ...
+```
+
+**配置项建议：**
+
+```python
+# app/config.py 新增
+bm25_refit_strategy: Literal["immediate", "lazy", "scheduled", "manual"] = "immediate"
+bm25_refit_batch_size: int = 5    # batch 策略下每 N 次更新触发一次
+```
+
+---
+
+### 方案三：增量 DF 统计近似更新（适合追求极低延迟的场景）
+
+**核心思路**：不做全量 refit，而是维护一份 `df_cache`（词 → 文档频率映射）和 `N`（总文档数），逐步更新：
+
+```python
+@dataclass
+class IncrementalBM25Stats:
+    df: dict[str, int]    # term → document frequency
+    N: int                # total document count
+
+    def add_document(self, tokens: list[str]):
+        self.N += 1
+        for term in set(tokens):    # set 去重，同一文档每个词只计一次
+            self.df[term] = self.df.get(term, 0) + 1
+
+    def remove_document(self, tokens: list[str]):
+        self.N = max(0, self.N - 1)
+        for term in set(tokens):
+            if term in self.df:
+                self.df[term] = max(0, self.df[term] - 1)
+
+    def idf(self, term: str) -> float:
+        df_t = self.df.get(term, 0)
+        return math.log((self.N - df_t + 0.5) / (df_t + 0.5) + 1)
+```
+
+**局限性**：
+- 删除文档时需要保存该文档的原始 token 列表
+- 与 `BM25EmbeddingFunction` 生成的稀疏向量格式不完全兼容，需自定义编码逻辑
+- **适合场景**：高更新频率（每分钟数次）、对近似误差容忍度较高
+
+---
+
+### 方案四：Milvus 2.5 内置全文检索（最优方案，推荐长期演进方向）
+
+**核心优势**：**Milvus 2.5（项目已使用 v2.5.10）原生支持 BM25 全文检索**，文档插入时由 Milvus 自动维护稀疏索引，完全规避 Python 侧的 refit 问题。
+
+**实现方式**：在 Schema 中使用 `enable_analyzer=True` 的 `VARCHAR` 字段 + 内置 BM25 函数：
+
+```python
+from pymilvus import DataType, FieldSchema, Function, FunctionType
+
+# Schema 定义
+fields = [
+    FieldSchema(name="content_text", dtype=DataType.VARCHAR,
+                max_length=8000, enable_analyzer=True),   # 启用分词器
+    FieldSchema(name="sparse_vector", dtype=DataType.SPARSE_FLOAT_VECTOR),  # BM25 输出
+    FieldSchema(name="dense_vector", dtype=DataType.FLOAT_VECTOR, dim=1024),
+    ...
+]
+
+# 定义 BM25 转换函数（Milvus 服务端自动执行）
+bm25_function = Function(
+    name="bm25",
+    function_type=FunctionType.BM25,
+    input_field_names=["content_text"],
+    output_field_names=["sparse_vector"],
+)
+
+schema = CollectionSchema(fields=fields, functions=[bm25_function])
+```
+
+**检索时**（无需 Python 侧 BM25 encode_queries）：
+
+```python
+sparse_req = AnnSearchRequest(
+    data=["CPU 使用率高排查步骤"],   # 直接传原始文本
+    anns_field="sparse_vector",
+    param={"metric_type": "BM25"},   # Milvus 内部处理 query 的 BM25 编码
+    limit=coarse_top_k,
+)
+```
+
+**优势**：
+- 文档增删时 Milvus 自动更新 BM25 统计，Python 侧零维护成本
+- 中文分词需配置 `Jieba` 分析器（Milvus 2.5+ 支持）
+- 无需序列化 BM25 模型文件
+
+**中文分词器配置示例（Milvus 2.5）：**
+
+```python
+analyzer_params = {"type": "chinese"}   # 中文分词器
+FieldSchema(name="content_text", ..., analyzer_params=analyzer_params)
+```
+
+---
+
+### 方案五：SPLADE 学习式稀疏编码（完全规避 refit）
+
+**核心思路**：使用基于 BERT 的 SPLADE 模型生成稀疏向量，不依赖任何语料统计：
+
+- 推荐模型：`naver/efficient-splade-VI-BT-large-query` / `naver/splade-v3`
+- 每个文档/query 独立通过 SPLADE 前向推理得到稀疏向量，新增文档时仅推理该文档
+- **缺点**：需要约 500MB+ 模型；推理延迟 > BM25；中文支持取决于模型预训练语料
+
+---
+
+### 推荐选择
+
+| 方案 | 适用阶段 | 推荐程度 | 关键优势 |
+|---|---|---|---|
+| 方案一：全量重建（从 Milvus） | 当前（语料小） | ⭐⭐⭐⭐⭐ | 实现简单，利用现有 Milvus 数据，< 1s |
+| 方案二：批量延迟 Refit | 语料增长后 | ⭐⭐⭐⭐ | 减少 refit 频率，配置灵活 |
+| 方案三：增量 DF 近似 | 高频更新场景 | ⭐⭐ | 极低延迟，但实现复杂、有误差 |
+| 方案四：Milvus 内置 BM25 | 长期演进 | ⭐⭐⭐⭐⭐ | 零维护成本，Milvus 自动管理 |
+| 方案五：SPLADE | 有 GPU 资源时 | ⭐⭐⭐ | 无 refit，但需额外模型 |
+
+**实施建议**：
+1. **短期（Enhanced RAG 初版）**：使用方案一，在 `index_single_file()` 完成后同步调用 `rebuild_bm25_from_milvus()`，序列化保存到 `data/bm25_model.pkl`
+2. **中期（语料达到 1000+ chunk）**：引入方案二的批量延迟策略，配置 `bm25_refit_strategy=scheduled`
+3. **长期（架构升级）**：迁移到方案四（Milvus 内置全文检索），彻底消除 Python 侧 BM25 维护负担
+
+---
+
 ## 注意事项
 
 1. **向量维度兼容性**：Dense metric 从 `L2` 改为 `COSINE` 后，Milvus 集合需重建（或创建新集合 `biz_enhanced`），建议保留原有 `biz` 集合以支持 `basic` 模式
-2. **BM25 状态持久化**：BM25 拟合后的词频统计需序列化保存，否则重启后无法复用已入库的稀疏向量
+2. **BM25 状态持久化**：BM25 拟合后的词频统计需序列化保存（`data/bm25_model.pkl`），否则重启后无法复用已入库的稀疏向量；推荐使用方案一配合持久化，或直接迁移到方案四
 3. **Cross-Encoder 资源需求**：`bge-reranker-v2-m3` 约 560MB，需预先下载并考虑内存开销；无 GPU 时可选更小的 `bge-reranker-base`
 4. **RAGAs LLM 配额**：评估时 RAGAs 会大量调用 LLM（每条数据多次），注意 DashScope API 调用成本和限速
 5. **可插拔性验证**：切换 `RAG_MODE` 或 `QUERY_PREPROCESSOR_TYPE` 后无需重启，通过延迟初始化（lazy singleton）实现
 6. **Reranker 使用原始 query**：预处理后 Reranker 打分始终使用原始用户 query，避免改写文本影响最终排序相关性
 7. **HyDE + 混合检索**：Dense 检索用假设文档向量，Sparse 检索回退用原始 query，两路策略不能混用同一文本
+8. **pymilvus 升级风险**：从 `>=2.3.5` 升级到 `>=2.4.6` 时，需验证 `_patch_pymilvus_milvus_client_orm_alias()` monkey-patch 是否仍有效

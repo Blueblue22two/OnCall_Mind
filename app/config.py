@@ -3,7 +3,7 @@
 使用 Pydantic Settings 实现类型安全的配置管理
 """
 
-from typing import Dict, Any
+from typing import Dict, Any, Literal
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     # RAG 配置
     rag_top_k: int = 3
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
+    rag_mode: Literal["basic", "enhanced"] = "basic"  # RAG 检索模式（basic/enhanced）
 
     # 文档分块配置
     chunk_max_size: int = 800
