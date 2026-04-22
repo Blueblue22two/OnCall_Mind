@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 from loguru import logger
 from pypdf import PdfReader
 
+from app.config import config
 from app.services.document_splitter_service import document_splitter_service
 from app.services.vector_store_manager import vector_store_manager
 
@@ -163,12 +164,25 @@ class VectorIndexService:
             documents = document_splitter_service.split_document(content, normalized_path)
             logger.info(f"文档分割完成: {file_path} -> {len(documents)} 个分片")
 
-            # 4. 添加文档到向量存储
+            # 4. 写入基础 biz collection（所有模式都写）
             if documents:
                 vector_store_manager.add_documents(documents)
-                logger.info(f"文件索引完成: {file_path}, 共 {len(documents)} 个分片")
+                logger.info(f"[Basic] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
             else:
                 logger.warning(f"文件内容为空或无法分割: {file_path}")
+
+            # 5. 同步写入 biz_enhanced collection（enhanced 模式预填充）
+            if documents:
+                try:
+                    from app.services.enhanced_vector_store_manager import (
+                        enhanced_vector_store_manager,
+                    )
+                    enhanced_vector_store_manager.delete_by_source(normalized_path)
+                    enhanced_vector_store_manager.add_documents(documents)
+                    logger.info(f"[Enhanced] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
+                except Exception as e:
+                    # enhanced 写入失败不影响基础功能
+                    logger.warning(f"[Enhanced] 文件写入失败（不影响基础检索）: {e}")
 
         except Exception as e:
             logger.error(f"索引文件失败: {file_path}, 错误: {e}")

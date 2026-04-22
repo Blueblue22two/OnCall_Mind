@@ -16,8 +16,7 @@ def get_rag_retriever() -> BaseRAGRetriever:
     from app.retriever.basic import BasicRAGRetriever
 
     if config.rag_mode == "enhanced":
-        # Phase 2 实现 EnhancedRAGRetriever 后在此接入
-        # 当前阶段回退到 BasicRAGRetriever
-        return BasicRAGRetriever()
+        from app.retriever.enhanced import EnhancedRAGRetriever
+        return EnhancedRAGRetriever()
 
     return BasicRAGRetriever()

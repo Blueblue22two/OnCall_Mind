@@ -16,7 +16,7 @@ dependencies = [
     "langgraph>=0.0.40",
     "dashscope>=1.14.0",
     "openai>=1.10.0",
-    "pymilvus>=2.3.5",
+    "pymilvus>=2.4.6",
     "pydantic>=2.5.0,<3.0.0",
     "pydantic-settings>=2.1.0",
     "httpx>=0.26.0",
@@ -31,6 +31,8 @@ dependencies = [
     "fastmcp>=2.14.0",
     "langchain-qwq>=0.3.4",
     "pypdf>=3.0.0",
+    # Enhanced RAG 依赖（rag_mode="enhanced" 时使用）
+    "FlagEmbedding>=1.2.0",     # Cross-Encoder 精排（bge-reranker-v2-m3）
 ]
 
 [project.optional-dependencies]

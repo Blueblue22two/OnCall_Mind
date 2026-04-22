@@ -39,6 +39,13 @@ class Settings(BaseSettings):
     rag_model: str = "qwen-max"  # 使用快速响应模型，不带扩展思考
     rag_mode: Literal["basic", "enhanced"] = "basic"  # RAG 检索模式（basic/enhanced）
 
+    # Enhanced RAG 配置（rag_mode="enhanced" 时生效）
+    query_preprocessor_type: Literal["none", "rewrite"] = "none"  # 查询预处理方式
+    reranker_type: Literal["none", "cross_encoder"] = "cross_encoder"  # 精排器类型
+    reranker_model: str = "BAAI/bge-reranker-v2-m3"  # 精排模型名称
+    reranker_top_k: int = 3   # 精排后最终返回文档数（应 <= rag_top_k）
+    rerank_coarse_top_k: int = 20  # 混合检索粗排候选数（供精排器输入）
+
     # 文档分块配置
     chunk_max_size: int = 800
     chunk_overlap: int = 100
