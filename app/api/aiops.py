@@ -151,3 +151,25 @@ async def diagnose_stream(request: AIOpsRequest):
             }
 
     return EventSourceResponse(event_generator())
+
+
+@router.get("/aiops/diagnosis/{session_id}")
+async def get_diagnosis_history(session_id: str, limit: int = 20):
+    """查询指定会话的历史诊断报告。
+
+    Args:
+        session_id: 会话ID。
+        limit: 返回记录数上限（默认 20）。
+
+    Returns:
+        {"session_id": str, "count": int, "records": list[dict]}
+    """
+    from app.services.diagnosis_store import get_diagnosis_store
+
+    store = get_diagnosis_store()
+    records = store.list_by_session(session_id, limit=limit)
+    return {
+        "session_id": session_id,
+        "count": len(records),
+        "records": records,
+    }

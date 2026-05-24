@@ -1,8 +1,9 @@
 """向量索引服务模块"""
 
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from loguru import logger
 from pypdf import PdfReader
@@ -10,6 +11,38 @@ from pypdf import PdfReader
 from app.config import config
 from app.services.document_splitter_service import document_splitter_service
 from app.services.vector_store_manager import vector_store_manager
+
+
+@dataclass
+class SingleFileIndexResult:
+    """单文件索引结果，包含双集合写入状态"""
+
+    file_path: str = ""
+    chunks_count: int = 0
+    basic_index_status: str = "skipped"  # success / failed / skipped
+    basic_index_error: str = ""
+    enhanced_index_status: str = "skipped"  # success / failed / skipped
+    enhanced_index_error: str = ""
+
+    @property
+    def partial_success(self) -> bool:
+        """基础集合成功但增强集合失败"""
+        return self.basic_index_status == "success" and self.enhanced_index_status == "failed"
+
+    @property
+    def fully_successful(self) -> bool:
+        return self.basic_index_status == "success" and self.enhanced_index_status in ("success", "skipped")
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "file_path": self.file_path,
+            "chunks_count": self.chunks_count,
+            "basic_index_status": self.basic_index_status,
+            "basic_index_error": self.basic_index_error,
+            "enhanced_index_status": self.enhanced_index_status,
+            "enhanced_index_error": self.enhanced_index_error,
+            "partial_success": self.partial_success,
+        }
 
 
 class IndexingResult:
@@ -105,9 +138,14 @@ class VectorIndexService:
             # 遍历并索引每个文件
             for file_path in files:
                 try:
-                    self.index_single_file(str(file_path))
+                    single_result = self.index_single_file(str(file_path))
                     result.increment_success_count()
-                    logger.info(f"✓ 文件索引成功: {file_path.name}")
+                    if single_result.partial_success:
+                        logger.warning(
+                            f"⚠ 文件部分索引成功（增强集合写入失败）: {file_path.name}"
+                        )
+                    else:
+                        logger.info(f"✓ 文件索引成功: {file_path.name}")
                 except Exception as e:
                     result.increment_fail_count()
                     result.add_failed_file(str(file_path), str(e))
@@ -130,18 +168,22 @@ class VectorIndexService:
             result.end_time = datetime.now()
             return result
 
-    def index_single_file(self, file_path: str):
+    def index_single_file(self, file_path: str) -> SingleFileIndexResult:
         """
         索引单个文件 (使用新的 LangChain 分割器)
 
         Args:
             file_path: 文件路径
 
+        Returns:
+            SingleFileIndexResult: 包含双集合写入状态的结果对象
+
         Raises:
             ValueError: 文件不存在时抛出
             RuntimeError: 索引失败时抛出
         """
         path = Path(file_path).resolve()
+        result = SingleFileIndexResult(file_path=str(path))
 
         if not path.exists() or not path.is_file():
             raise ValueError(f"文件不存在: {file_path}")
@@ -163,26 +205,41 @@ class VectorIndexService:
             # 3. 使用新的文档分割器
             documents = document_splitter_service.split_document(content, normalized_path)
             logger.info(f"文档分割完成: {file_path} -> {len(documents)} 个分片")
+            result.chunks_count = len(documents)
+
+            if not documents:
+                logger.warning(f"文件内容为空或无法分割: {file_path}")
+                return result
 
             # 4. 写入基础 biz collection（所有模式都写）
-            if documents:
+            try:
                 vector_store_manager.add_documents(documents)
+                result.basic_index_status = "success"
                 logger.info(f"[Basic] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
-            else:
-                logger.warning(f"文件内容为空或无法分割: {file_path}")
+            except Exception as e:
+                result.basic_index_status = "failed"
+                result.basic_index_error = str(e)
+                logger.error(f"[Basic] 文件写入失败: {e}")
+                raise RuntimeError(f"基础集合写入失败: {e}") from e
 
             # 5. 同步写入 biz_enhanced collection（enhanced 模式预填充）
-            if documents:
-                try:
-                    from app.services.enhanced_vector_store_manager import (
-                        enhanced_vector_store_manager,
-                    )
-                    enhanced_vector_store_manager.delete_by_source(normalized_path)
-                    enhanced_vector_store_manager.add_documents(documents)
-                    logger.info(f"[Enhanced] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
-                except Exception as e:
-                    # enhanced 写入失败不影响基础功能
-                    logger.warning(f"[Enhanced] 文件写入失败（不影响基础检索）: {e}")
+            try:
+                from app.services.enhanced_vector_store_manager import (
+                    enhanced_vector_store_manager,
+                )
+                enhanced_vector_store_manager.delete_by_source(normalized_path)
+                enhanced_vector_store_manager.add_documents(documents)
+                result.enhanced_index_status = "success"
+                logger.info(f"[Enhanced] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
+            except Exception as e:
+                result.enhanced_index_status = "failed"
+                result.enhanced_index_error = str(e)
+                logger.warning(
+                    f"[Enhanced] 文件写入失败（不影响基础检索）: {e}"
+                    f" | file={file_path}, chunks={len(documents)}"
+                )
+
+            return result
 
         except Exception as e:
             logger.error(f"索引文件失败: {file_path}, 错误: {e}")

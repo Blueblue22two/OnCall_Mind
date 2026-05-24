@@ -68,25 +68,39 @@ async def upload_file(file: UploadFile = File(...)):
         logger.info(f"文件上传成功: {file_path}")
 
         # 5. 自动创建向量索引
+        index_result = None
         try:
             logger.info(f"开始为上传文件创建向量索引: {file_path}")
-            vector_index_service.index_single_file(str(file_path))
+            index_result = vector_index_service.index_single_file(str(file_path))
             logger.info(f"向量索引创建成功: {file_path}")
         except Exception as e:
             logger.error(f"向量索引创建失败: {file_path}, 错误: {e}")
-            # 注意：即使索引失败，文件上传仍然成功，只是记录错误日志
+            # 索引失败不影响上传成功，但需要在响应中体现
+            raise HTTPException(
+                status_code=500,
+                detail=f"文件上传成功但向量索引创建失败: {e}",
+            )
 
         # 6. 返回响应
+        response_data: Dict[str, Any] = {
+            "filename": safe_filename,
+            "file_path": str(file_path),
+            "size": len(content),
+            "chunks_count": index_result.chunks_count if index_result else 0,
+            "basic_index_status": index_result.basic_index_status if index_result else "skipped",
+            "enhanced_index_status": index_result.enhanced_index_status if index_result else "skipped",
+        }
+        if index_result and index_result.partial_success:
+            response_data["partial_success_reason"] = (
+                f"基础集合索引成功，增强集合索引失败: {index_result.enhanced_index_error}"
+            )
+
         return JSONResponse(
             status_code=200,
             content={
                 "code": 200,
                 "message": "success",
-                "data": {
-                    "filename": safe_filename,
-                    "file_path": str(file_path),
-                    "size": len(content),
-                },
+                "data": response_data,
             },
         )
 

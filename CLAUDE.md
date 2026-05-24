@@ -84,7 +84,6 @@ HTTP/SSE Client
 | `aiops-docs/` | Markdown files ingested as the default RAG knowledge base |
 
 ### Two Agent Patterns
-
 **RAG Agent** (`RagAgentService`): Standard ReAct loop using `ChatQwen` + LangGraph with `MemorySaver` for multi-turn conversation. Tools: `retrieve_knowledge`, `get_current_time`, plus all MCP tools loaded dynamically at init.
 
 **AIOps Agent** (`AIOpsService`): Plan-Execute-Replan loop — a `planner` node generates a step list, the `executor` node runs one step using MCP tools, and the `replanner` node either updates the plan or generates a final response. The graph exits when `state["response"]` is set.
@@ -110,36 +109,3 @@ Both agent types use `get_mcp_client_with_retry()` from `app/agent/mcp_client.py
 | `MCP_CLS_URL` | `http://localhost:8003/mcp` | CLS MCP endpoint |
 | `MCP_MONITOR_URL` | `http://localhost:8004/mcp` | Monitor MCP endpoint |
 | `DEBUG` | `false` | Enable hot-reload and debug mode |
-
-## Testing
-
-Tests live in `tests/` mirroring `app/` structure. Uses `pytest-asyncio` in auto mode. `pyproject.toml` configures coverage for the `app/` package by default, so `make test` always reports coverage. Use `make test-quick` to skip the coverage overhead during development.
-
-## RAG Optimization Roadmap (plans.md / eval.md)
-
-Three-phase plan documented in `plans.md`; difficulty/framework evaluation in `eval.md`.
-
-### Current RAG Limitations
-- Single dense vector field (`vector`, 1024-dim, **L2**, IVF_FLAT, nlist=128)
-- Collection name: `biz`; no sparse vector, no reranking, no query preprocessing
-- `retrieve_knowledge` in `app/tools/knowledge_tool.py` is **synchronous** — must stay sync or all callers updated together
-- `pymilvus` currently pinned at `>=2.3.5`; enhanced RAG requires `>=2.4.6`
-
-### Phase 1 — Pluggable Interface (P0, low effort)
-New module `app/retriever/` with `base.py` (ABC), `basic.py` (wraps current logic), `factory.py` (returns impl by config).  
-New config field: `rag_mode: Literal["basic", "enhanced"] = "basic"` / `.env`: `RAG_MODE=basic`.  
-`retrieve_knowledge` tool signature (`@tool(response_format="content_and_artifact")`) must not change.
-
-### Phase 2 — Enhanced RAG (P1–P2, medium effort)
-- **Dual-vector schema**: new collection `biz_enhanced` (keep `biz` for basic mode); add `dense_vector` (FLOAT_VECTOR, 1024-dim, COSINE) + `sparse_vector` (SPARSE_FLOAT_VECTOR)
-- **BM25 sparse encoding**: `pymilvus.model.sparse.BM25EmbeddingFunction`; fit on full corpus after ingestion; serialize to `data/bm25_model.pkl`. Short-term: full rebuild from Milvus `content` field on each update (corpus ~20–50 chunks, <1s). Long-term: migrate to Milvus 2.5 built-in BM25 (`FunctionType.BM25` + Chinese analyzer).
-- **Hybrid search**: `AnnSearchRequest × 2 + RRFRanker(k=60)` via `pymilvus` native API
-- **Query preprocessing** (`app/retriever/preprocessing/`): `none` / `rewrite` / `hyde` / `multi_query`; HyDE uses hypothetical doc for Dense but original query for Sparse
-- **Reranker**: `BAAI/bge-reranker-v2-m3` via `FlagEmbedding` (560MB, CPU ~200–800ms); always scores against original query
-- New config fields: `query_preprocessor_type`, `reranker_type`, `reranker_top_k`, `rerank_coarse_top_k`, `bm25_refit_strategy`
-- **pymilvus monkey-patch** (`_patch_pymilvus_milvus_client_orm_alias` in `milvus_client.py`) must be re-validated after upgrading pymilvus
-
-### Phase 3 — RAGAs Evaluation (P2, medium effort)
-`tests/evaluation/` with `rag_testset.py` (15–25 Q&A pairs from `aiops-docs/`), `evaluate_rag.py`, `compare_reports.py`.  
-LLM judge reuses `ChatQwen` via `LangchainLLMWrapper`. Target: `context_precision` and `context_recall` ≥ 0.7 (basic baseline); enhanced mode +0.10 on both.  
-New deps: `ragas>=0.1.0`, `datasets>=2.0.0`, `FlagEmbedding>=1.2.0`, `rank_bm25>=0.2.2`.
