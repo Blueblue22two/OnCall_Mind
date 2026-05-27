@@ -159,7 +159,7 @@ class EnhancedVectorStoreManager:
             collection = self._get_collection()
             results = collection.hybrid_search(
                 reqs=[dense_req, sparse_req],
-                ranker=ranker,
+                rerank=ranker,
                 limit=top_k,
                 output_fields=["content_text", "metadata"],
             )

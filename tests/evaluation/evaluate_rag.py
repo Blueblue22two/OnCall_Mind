@@ -28,12 +28,58 @@ Enhanced 模式目标：      context_precision ≥ 0.80, context_recall ≥ 0.8
 import argparse
 import asyncio
 import json
+import math
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from loguru import logger
+
+
+def _coerce_metric_score(value: Any, metric_name: str) -> float:
+    """Convert RAGAs metric output to a stable aggregate float.
+
+    RAGAs versions differ in whether ``result[metric]`` returns an aggregate
+    score or per-sample scores. With ``raise_exceptions=False``, failed jobs can
+    also leave None/NaN values in the per-sample list.
+    """
+    if isinstance(value, (list, tuple)):
+        scores = []
+        skipped = 0
+        for item in value:
+            try:
+                score = float(item)
+            except (TypeError, ValueError):
+                skipped += 1
+                continue
+            if math.isfinite(score):
+                scores.append(score)
+            else:
+                skipped += 1
+
+        if not scores:
+            logger.warning(f"{metric_name} 没有可用分数，返回 0.0")
+            return 0.0
+
+        if skipped:
+            logger.warning(
+                f"{metric_name} 有 {skipped} 个无效/超时分数被忽略，"
+                f"使用 {len(scores)} 个有效分数取平均"
+            )
+        return round(sum(scores) / len(scores), 4)
+
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        logger.warning(f"{metric_name} 返回值无法转换为 float: {type(value).__name__}，返回 0.0")
+        return 0.0
+
+    if not math.isfinite(score):
+        logger.warning(f"{metric_name} 返回 NaN/Inf，返回 0.0")
+        return 0.0
+
+    return round(score, 4)
 
 
 def _build_rag_pipeline():
@@ -93,20 +139,19 @@ def _build_llm_wrapper():
     try:
         from ragas.llms import LangchainLLMWrapper
         from ragas.embeddings import LangchainEmbeddingsWrapper
-        from langchain_community.chat_models import ChatTongyi
+        from langchain_openai import ChatOpenAI
         from app.config import config
         from app.services.vector_embedding_service import vector_embedding_service
 
-        llm_kwargs = {
-            "model": config.eval_judge_model,
-            "temperature": config.eval_judge_temperature,
-            "dashscope_api_key": config.eval_judge_api_key or config.dashscope_api_key,
-        }
-        judge_api_base = config.eval_judge_api_base
-        if judge_api_base:
-            llm_kwargs["dashscope_api_base"] = judge_api_base
+        judge_api_base = config.eval_judge_api_base or config.dashscope_api_base
+        judge_api_key = config.eval_judge_api_key or config.dashscope_api_key
 
-        llm = ChatTongyi(**llm_kwargs)
+        llm = ChatOpenAI(
+            model=config.eval_judge_model,
+            temperature=config.eval_judge_temperature,
+            api_key=judge_api_key,
+            base_url=judge_api_base,
+        )
         ragas_llm = LangchainLLMWrapper(llm)
         ragas_embeddings = LangchainEmbeddingsWrapper(vector_embedding_service)
         return ragas_llm, ragas_embeddings
@@ -335,8 +380,14 @@ def run_evaluation(
     )
 
     retrieval_metrics = {
-        "context_precision": float(retrieval_result["context_precision"]),
-        "context_recall": float(retrieval_result["context_recall"]),
+        "context_precision": _coerce_metric_score(
+            retrieval_result["context_precision"],
+            "context_precision",
+        ),
+        "context_recall": _coerce_metric_score(
+            retrieval_result["context_recall"],
+            "context_recall",
+        ),
     }
 
     # 计算非 LLM 检索指标（Hit Rate@k + MRR，基于 relevant_docs 标注）
@@ -400,8 +451,14 @@ def run_evaluation(
                     raise_exceptions=False,
                 )
                 generation_metrics = {
-                    "faithfulness": float(gen_result["faithfulness"]),
-                    "answer_relevancy": float(gen_result["answer_relevancy"]),
+                    "faithfulness": _coerce_metric_score(
+                        gen_result["faithfulness"],
+                        "faithfulness",
+                    ),
+                    "answer_relevancy": _coerce_metric_score(
+                        gen_result["answer_relevancy"],
+                        "answer_relevancy",
+                    ),
                     "answers_generated": answers_generated,
                     "answers_failed": answers_failed,
                 }

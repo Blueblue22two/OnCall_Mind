@@ -1,4 +1,4 @@
-"""CrossEncoderReranker — 使用 FlagEmbedding BGE Cross-Encoder 精排
+"""CrossEncoderReranker — 使用 sentence-transformers Cross-Encoder 精排
 
 模型: BAAI/bge-reranker-v2-m3
   - 多语言 Cross-Encoder，中英文表现优异
@@ -17,46 +17,30 @@ from app.retriever.reranker.base import BaseReranker
 
 
 class CrossEncoderReranker(BaseReranker):
-    """基于 BGE Cross-Encoder 的精排器（懒加载模型）"""
+    """基于 sentence-transformers Cross-Encoder 的精排器（懒加载模型）"""
 
     def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3") -> None:
         self._model_name = model_name
-        self._model = None  # 懒初始化，避免导入时加载 560MB 模型
+        self._model = None
 
     def _get_model(self):
-        """懒初始化 FlagReranker（首次调用时加载模型权重）"""
         if self._model is None:
             try:
-                from FlagEmbedding import FlagReranker  # type: ignore[import-untyped]
+                from sentence_transformers import CrossEncoder
 
-                self._model = FlagReranker(
-                    self._model_name,
-                    use_fp16=True,  # 半精度推理，减少内存占用并加速 CPU 推理
-                )
+                self._model = CrossEncoder(self._model_name)
                 logger.info(f"[Reranker:cross_encoder] 模型加载完成: {self._model_name}")
             except ImportError as e:
                 raise ImportError(
-                    "CrossEncoderReranker 需要安装 FlagEmbedding: "
-                    "pip install FlagEmbedding>=1.2.0"
+                    "CrossEncoderReranker 需要安装 sentence-transformers"
                 ) from e
         return self._model
 
     def rerank(self, query: str, documents: list[Document], top_k: int) -> list[Document]:
-        """使用 Cross-Encoder 对文档列表重排序
-
-        Args:
-            query: 用户原始查询（用于评分，不用改写后的查询）
-            documents: 候选文档列表
-            top_k: 精排后返回数量
-
-        Returns:
-            list[Document]: 按 Cross-Encoder 分数降序排列的 top_k 文档
-        """
         if not documents:
             return []
 
         if len(documents) <= top_k:
-            # 候选数量不超过 top_k，无需精排
             logger.debug(
                 f"[Reranker:cross_encoder] 候选数({len(documents)}) <= top_k({top_k})，跳过精排"
             )
@@ -65,13 +49,9 @@ class CrossEncoderReranker(BaseReranker):
         try:
             model = self._get_model()
 
-            # 构造 (query, passage) 对
             pairs = [[query, doc.page_content] for doc in documents]
+            scores = model.predict(pairs, apply_softmax=True)
 
-            # 批量打分（分数越高越相关）
-            scores = model.compute_score(pairs, normalize=True)
-
-            # 按分数降序排列，取前 top_k
             scored_docs = sorted(
                 zip(scores, documents),
                 key=lambda x: x[0],
@@ -88,5 +68,4 @@ class CrossEncoderReranker(BaseReranker):
 
         except Exception as e:
             logger.error(f"[Reranker:cross_encoder] 精排失败，回退到截断: {e}")
-            # 精排失败时安全回退：返回原始顺序的前 top_k 个
             return documents[:top_k]

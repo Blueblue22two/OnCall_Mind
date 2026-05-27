@@ -63,8 +63,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     eval_judge_model: str = "qwen3.5-plus"
     eval_judge_temperature: float = 0.0
-    eval_judge_api_base: str = "https://api.vveai.com"   # 空则复用 DASHSCOPE_API_BASE
-    eval_judge_api_key: str = "sk-tIwB8FcGt5tcFGze48BfE3D418A44c93BaBd51A4806988F3"    # 空则复用 DASHSCOPE_API_KEY
+    eval_judge_api_base: str = "https://api.vveai.com/v1"   # 空则复用 DASHSCOPE_API_BASE
+    eval_judge_api_key: str = "sk-7YJ2MiMARBNfW9Qn43D83c378f504e4cA7B6CdC68027F491"    # 空则复用 DASHSCOPE_API_KEY
 
     # 文档分块配置
     chunk_max_size: int = 800

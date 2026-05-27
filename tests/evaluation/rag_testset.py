@@ -11,6 +11,7 @@
   - exact_keyword : 精确关键词/技术术语查询
   - colloquial    : 口语化查询
   - cross_doc     : 跨文档综合查询
+  - edge_case     : 边界/反事实/关联影响查询
 
 relevant_docs 说明：
   存储与当前问题相关的源文档文件名列表（如 ["cpu_high_usage.md"]）。
@@ -108,7 +109,7 @@ from typing import List, Optional
 # ---------------------------------------------------------------------------
 # 数据集版本号 — 修改测试集内容后递增
 # ---------------------------------------------------------------------------
-DATASET_VERSION = "1.1.1"
+DATASET_VERSION = "1.1.2"
 
 
 @dataclass
@@ -142,7 +143,7 @@ def validate_testset(samples: List[EvalSample]) -> List[str]:
         errors.append("数据集为空，至少需要一条样本")
         return errors
 
-    valid_categories = {"exact_keyword", "colloquial", "cross_doc"}
+    valid_categories = {"exact_keyword", "colloquial", "cross_doc", "edge_case"}
 
     for i, s in enumerate(samples):
         prefix = f"[样本 {i}]"
@@ -169,7 +170,7 @@ def validate_testset(samples: List[EvalSample]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# 评估数据集（25 题，覆盖 5 篇文档）
+# 评估数据集
 # ---------------------------------------------------------------------------
 
 EVALUATION_DATASET: List[EvalSample] = [
@@ -439,6 +440,56 @@ EVALUATION_DATASET: List[EvalSample] = [
         relevant_docs=["slow_response.md"],
         category="cross_doc",
     ),
+    EvalSample(
+        question="CPU 和内存同时告警时，怎么判断是代码问题还是流量突增？",
+        ground_truths=[
+            "CPU 文档建议检查是否存在单进程接近100%的死循环、重复错误堆栈，或多个进程随流量均匀升高",
+            "内存文档建议观察内存是否持续缓慢上升、Full GC 后无法释放，或是否随请求量突然升高",
+            "如果是代码问题，应保留日志和堆转储后回滚或修复；如果是流量突增，应扩容并启用限流保护",
+        ],
+        relevant_docs=["cpu_high_usage.md", "memory_high_usage.md"],
+        category="cross_doc",
+    ),
+    EvalSample(
+        question="服务不可用同时 API 5xx 飙升，第一轮排查怎么做？",
+        ground_truths=[
+            "服务不可用文档要求先确认健康检查失败或错误率超过50%，查询最近15分钟 ERROR/FATAL/status:500 日志和系统事件",
+            "API 错误率文档要求按最近30分钟检索 api-gateway-logs 中 level:ERROR 或 status:5xx，并分析错误类型、路径和堆栈",
+            "两类文档都强调检查依赖服务、配置变更、网络连接和发布回滚，先止损再定位根因",
+        ],
+        relevant_docs=["service_unavailable.md", "api_error_rate_spike.md"],
+        category="cross_doc",
+    ),
+    EvalSample(
+        question="网络延迟高导致接口变慢时，要同时看哪些指标和日志？",
+        ground_truths=[
+            "网络延迟文档建议查询 network-metrics 中 latency > 500 的服务对，并从应用日志确认 RPC 超时和受影响调用",
+            "慢响应文档建议查询 response_time > 3000 或 slow_query 日志，同时检查数据库慢查询和系统资源使用情况",
+            "需要结合 CPU、内存、网络延迟、下游超时和慢 SQL 判断瓶颈，必要时降级非核心调用并调整超时配置",
+        ],
+        relevant_docs=["network_high_latency.md", "slow_response.md"],
+        category="cross_doc",
+    ),
+    EvalSample(
+        question="数据库连接池满了以后接口响应慢，应该怎么联动排查？",
+        ground_truths=[
+            "连接池耗尽文档要求检查活跃连接数、空闲连接数、等待队列长度，以及 database_connection_error 或 connection_timeout 日志",
+            "慢响应文档提示慢 SQL、数据库 CPU 高和连接池接近满载都会导致 P99 响应时间超过阈值",
+            "处理上应先释放或扩容连接、启用限流，再优化慢查询、添加索引或调整连接池配置",
+        ],
+        relevant_docs=["database_connection_pool_exhaustion.md", "slow_response.md"],
+        category="cross_doc",
+    ),
+    EvalSample(
+        question="缓存雪崩发展成服务不可用时，应该先恢复缓存还是先做降级？",
+        ground_truths=[
+            "缓存雪崩文档说明命中率骤降和数据库 QPS 飙升会让服务响应变慢，需立即预热热点数据并优化缓存策略",
+            "服务不可用文档强调先确认故障、启动应急响应，并对非关键依赖启用熔断、降级或返回缓存数据",
+            "应并行止损：对外降级或切流保护核心链路，同时恢复缓存、限制数据库压力并检查应用错误日志",
+        ],
+        relevant_docs=["cache_avalanche.md", "service_unavailable.md"],
+        category="cross_doc",
+    ),
 
     # -------------------------------------------------------
     # 批次: candidate_questions_20260522_205717.json（导入于 2026-05-22 21:17）
@@ -475,13 +526,23 @@ EVALUATION_DATASET: List[EvalSample] = [
         category="colloquial",
     ),
     EvalSample(
-        question="API 错误率飙升可能是哪些原因导致的？",
+        question="API 错误率从正常水平突然升高，一般要先怀疑哪些方向？",
         ground_truths=[
             "上游依赖故障：日志中有上游服务调用失败记录",
             "代码缺陷：特定代码路径频繁抛出异常",
             "配置错误：最近有配置变更，日志中有配置加载错误",
             "流量峰值：请求量突然激增，响应时间变长但无明显错误",
             "网络问题：无法访问服务，网络连接超时",
+        ],
+        relevant_docs=["api_error_rate_spike.md"],
+        category="colloquial",
+    ),
+    EvalSample(
+        question="API 5xx 持续升高时，日志里要重点看哪些信息？",
+        ground_truths=[
+            "应先确定告警发生的时间范围，再检索 api-gateway-logs 中 level:ERROR 或 status:5xx 的日志",
+            "需要从错误日志中提取错误类型、错误频率、请求路径、请求参数和错误堆栈",
+            "结合日志判断是否是上游依赖故障、代码缺陷、配置错误、流量峰值或网络问题导致",
         ],
         relevant_docs=["api_error_rate_spike.md"],
         category="colloquial",
@@ -529,7 +590,7 @@ EVALUATION_DATASET: List[EvalSample] = [
         category="colloquial",
     ),
     EvalSample(
-        question="网络延迟高会影响缓存吗？",
+        question="网络链路抖动会不会让缓存表现得像失效了？",
         ground_truths=[
             "网络故障可能导致缓存服务器不可达",
             "网络延迟高会导致缓存命中率骤降",
@@ -746,6 +807,26 @@ EVALUATION_DATASET: List[EvalSample] = [
         category="edge_case",
     ),
     EvalSample(
+        question="MessageQueueBacklog 告警的触发条件是什么？",
+        ground_truths=[
+            "MessageQueueBacklog 的告警级别为严重",
+            "触发条件是 Kafka 或 RocketMQ 消费延迟持续10分钟超过10000条",
+            "消息积压会导致消费延迟增加、业务延迟，并可能让下游服务响应变慢或失败",
+        ],
+        relevant_docs=["message_queue_backlog.md"],
+        category="exact_keyword",
+    ),
+    EvalSample(
+        question="证书快到期但还没过期时，会不会已经影响接口调用？",
+        ground_truths=[
+            "证书未过期时通常不会直接阻断接口调用，但握手和校验过程可能变慢",
+            "如果证书链不完整或客户端校验策略更严格，仍可能出现 TLS 握手失败",
+            "应尽快续签并更新证书，避免到期后影响服务可用性",
+        ],
+        relevant_docs=["certificate_expiry.md", "slow_response.md"],
+        category="edge_case",
+    ),
+    EvalSample(
         question="NetworkHighLatency 告警的触发条件是什么？",
         ground_truths=[
             "服务间网络延迟 P99 持续5分钟超过500ms",
@@ -757,7 +838,7 @@ EVALUATION_DATASET: List[EvalSample] = [
         category="exact_keyword",
     ),
     EvalSample(
-        question="网络延迟过高怎么排查？",
+        question="网络延迟过高时，怎么判断是链路问题还是服务自身问题？",
         ground_truths=[
             "使用 search_log 查询 network-metrics 日志主题，确认延迟最高的服务对",
             "通过应用日志中的 RPC 调用耗时记录确认受影响的服务间调用",
@@ -778,7 +859,7 @@ EVALUATION_DATASET: List[EvalSample] = [
         category="colloquial",
     ),
     EvalSample(
-        question="网络延迟高会导致哪些问题？",
+        question="网络延迟升高后，通常先拖慢哪些业务环节？",
         ground_truths=[
             "可能导致服务间调用超时。",
             "请求堆积，用户体验下降。",
@@ -788,7 +869,7 @@ EVALUATION_DATASET: List[EvalSample] = [
         category="colloquial",
     ),
     EvalSample(
-        question="数据库连接池耗尽会影响网络延迟吗？",
+        question="数据库连接池耗尽会让外部请求的延迟表现出什么特征？",
         ground_truths=[
             "数据库连接池耗尽可能导致应用线程阻塞等待连接，间接增加请求处理延迟",
             "大量阻塞线程可能占满应用线程池，导致新的网络请求无法被处理",
