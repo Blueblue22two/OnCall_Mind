@@ -2,6 +2,9 @@
 
 使用 langchain_qwq 的 ChatQwen 原生集成，
 支持真正的流式输出和更好的模型适配。
+
+支持上下文裁剪策略：根据 token 数裁剪消息历史，
+确保上下文窗口不超过配置上限。
 """
 
 from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
@@ -10,11 +13,10 @@ from langchain.agents import create_agent
 from langchain_core.messages import (
     BaseMessage,
     HumanMessage,
-    RemoveMessage,
     SystemMessage,
 )
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph.message import REMOVE_ALL_MESSAGES, add_messages
+from langgraph.graph.message import add_messages
 from loguru import logger
 from typing_extensions import TypedDict
 from langchain_qwq import ChatQwen
@@ -33,44 +35,50 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
 
 
-def trim_messages_middleware(state: AgentState) -> dict[str, Any] | None:
-    """
-    修剪消息历史，只保留最近的几条消息以适应上下文窗口
-
-    策略：
-    - 保留第一条系统消息（System Message）
-    - 保留最近的 6 条消息（3 轮对话）
-    - 当消息少于等于 7 条时，不做修剪
+def trim_messages_by_tokens(
+    messages: Sequence[BaseMessage],
+    max_tokens: int = 8000,
+    model_encoding: str = "cl100k_base",
+) -> list[BaseMessage]:
+    """按 token 数裁剪消息历史，保留首条 system message + 从新到旧裁剪到 max_tokens。
 
     Args:
-        state: Agent 状态
+        messages: 消息列表。
+        max_tokens: token 上限。
+        model_encoding: tiktoken encoding 名称。
 
     Returns:
-        包含修剪后消息的字典，如果无需修剪则返回 None
+        list[BaseMessage]: 裁剪后的消息列表。
     """
-    messages = state["messages"]
+    import tiktoken
 
-    # 如果消息数量较少，无需修剪
-    if len(messages) <= 7:
-        return None
+    if not messages:
+        return list(messages)
 
-    # 提取第一条系统消息
+    enc = tiktoken.get_encoding(model_encoding)
+
+    # 始终保留首条消息（通常为 SystemMessage）
     first_msg = messages[0]
+    first_tokens = len(enc.encode(str(first_msg.content or "")))
 
-    # 保留最近的 6 条消息（确保包含完整的对话轮次）
-    recent_messages = messages[-6:] if len(messages) % 2 == 0 else messages[-7:]
+    kept: list[BaseMessage] = []
+    remaining = max_tokens - first_tokens
 
-    # 构建新的消息列表
-    new_messages = [first_msg] + list(recent_messages)
+    # 从最新到最旧遍历（跳过第一条）
+    for msg in reversed(messages[1:]):
+        content = str(msg.content or "")
+        msg_tokens = len(enc.encode(content))
+        if remaining - msg_tokens < 0:
+            break
+        kept.insert(0, msg)
+        remaining -= msg_tokens
 
-    logger.debug(f"修剪消息历史: {len(messages)} -> {len(new_messages)} 条")
-
-    return {
-        "messages": [
-            RemoveMessage(id=REMOVE_ALL_MESSAGES),
-            *new_messages
-        ]
-    }
+    result = [first_msg] + kept
+    logger.debug(
+        f"Token 裁剪: {len(messages)} -> {len(result)} 条消息, "
+        f"tokens={sum(len(enc.encode(str(m.content or ''))) for m in result)}"
+    )
+    return result
 
 
 class RagAgentService:
@@ -100,8 +108,14 @@ class RagAgentService:
         # MCP 客户端（延迟初始化，使用全局管理）
         self.mcp_tools: list = []
 
-        # 创建内存检查点（用于会话管理）
-        self.checkpointer = MemorySaver()
+        # 创建检查点（Redis 或内存，用于会话管理）
+        if config.redis_url:
+            from langgraph.checkpoint.redis import RedisSaver
+            self.checkpointer = RedisSaver.from_conn_string(config.redis_url)
+            logger.info(f"使用 RedisSaver: {config.redis_url}")
+        else:
+            self.checkpointer = MemorySaver()
+            logger.info("使用 MemorySaver（进程内存）")
 
         # Agent 初始化（会在异步方法中完成）
         self.agent = None
@@ -196,6 +210,10 @@ class RagAgentService:
                 HumanMessage(content=question)
             ]
 
+            # Token 裁剪（如果启用了 token_count 策略）
+            if config.context_trimming_strategy == "token_count":
+                messages = trim_messages_by_tokens(messages, max_tokens=config.context_max_tokens)
+
             # 构建 Agent 输入
             agent_input = {"messages": messages}
 
@@ -232,6 +250,88 @@ class RagAgentService:
             logger.error(f"[会话 {session_id}] RAG Agent 查询失败（非流式）: {e}")
             raise
 
+    async def query_with_trace(
+        self,
+        question: str,
+        session_id: str,
+    ) -> dict[str, Any]:
+        """执行 Agent 并返回 answer + 结构化 tool_calls trace。
+
+        用于评估脚本捕获 Agent 的工具调用行为。
+        不修改现有 query() / query_stream() 接口。
+
+        Args:
+            question: 用户问题。
+            session_id: 会话ID（作为 thread_id）。
+
+        Returns:
+            dict: {
+                "answer": str,                    # Agent 最终回答
+                "tool_calls": [{"name": str, "args": dict}, ...],  # 工具调用列表
+            }
+        """
+        try:
+            await self._initialize_agent()
+
+            logger.info(f"[会话 {session_id}] RAG Agent query_with_trace 收到查询: {question}")
+
+            messages = [
+                SystemMessage(content=self.system_prompt),
+                HumanMessage(content=question),
+            ]
+
+            # Token 裁剪（如果启用了 token_count 策略）
+            if config.context_trimming_strategy == "token_count":
+                messages = trim_messages_by_tokens(messages, max_tokens=config.context_max_tokens)
+
+            agent_input: dict[str, Any] = {"messages": messages}
+
+            config_dict: dict[str, Any] = {
+                "configurable": {
+                    "thread_id": session_id,
+                },
+            }
+
+            result = await self.agent.ainvoke(
+                input=agent_input,
+                config=config_dict,
+            )
+
+            # 提取所有消息中的工具调用
+            messages_result = result.get("messages", [])
+            tool_calls: list[dict[str, Any]] = []
+
+            for msg in messages_result:
+                if hasattr(msg, "tool_calls") and msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        tool_calls.append({
+                            "name": tc.get("name", "unknown"),
+                            "args": tc.get("args", {}),
+                        })
+
+            # 最后一条非空消息的内容作为 answer
+            answer: str = ""
+            for msg in reversed(messages_result):
+                content = msg.content if hasattr(msg, "content") else str(msg)
+                if content and content.strip():
+                    answer = content
+                    break
+
+            logger.info(
+                f"[会话 {session_id}] query_with_trace 完成: "
+                f"tool_calls={len(tool_calls)}, "
+                f"tools={[tc['name'] for tc in tool_calls]}"
+            )
+
+            return {
+                "answer": answer,
+                "tool_calls": tool_calls,
+            }
+
+        except Exception as e:
+            logger.error(f"[会话 {session_id}] RAG Agent query_with_trace 失败: {e}")
+            raise
+
     async def query_stream(
         self,
         question: str,
@@ -259,6 +359,10 @@ class RagAgentService:
                 SystemMessage(content=self.system_prompt),
                 HumanMessage(content=question)
             ]
+
+            # Token 裁剪（如果启用了 token_count 策略）
+            if config.context_trimming_strategy == "token_count":
+                messages = trim_messages_by_tokens(messages, max_tokens=config.context_max_tokens)
 
             # 构建 Agent 输入
             agent_input = {"messages": messages}

@@ -7,7 +7,7 @@ from langchain_core.tools import tool
 from loguru import logger
 
 from app.config import config
-from app.services.vector_store_manager import vector_store_manager
+from app.retriever.factory import get_rag_retriever
 
 
 @tool(response_format="content_and_artifact")
@@ -24,14 +24,17 @@ def retrieve_knowledge(query: str) -> Tuple[str, List[Document]]:
     """
     try:
         logger.info(f"知识检索工具被调用: query='{query}'")
-        
-        # 从向量存储中检索相关文档
-        vector_store = vector_store_manager.get_vector_store()
-        retriever = vector_store.as_retriever(
-            search_kwargs={"k": config.rag_top_k}
-        )
-        
-        docs = retriever.invoke(query)
+
+        # 根据 rag_mode 选择对应的 top_k
+        # - basic 模式：使用 rag_top_k 控制最终返回数
+        # - enhanced 模式：使用 reranker_top_k 控制精排后截断数
+        if config.rag_mode == "enhanced":
+            effective_top_k = config.reranker_top_k
+        else:
+            effective_top_k = config.rag_top_k
+
+        # 通过工厂获取当前配置的检索器（basic 或 enhanced），执行检索
+        docs = get_rag_retriever().retrieve(query, top_k=effective_top_k)
         
         if not docs:
             logger.warning("未检索到相关文档")

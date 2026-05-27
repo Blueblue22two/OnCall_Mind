@@ -65,6 +65,10 @@ uploads/
 .DS_Store
 Thumbs.db
 
+# Evaluation & Diagnosis reports
+reports/
+diagnosis_reports/
+
 # Pytest
 .pytest_cache/
 .coverage

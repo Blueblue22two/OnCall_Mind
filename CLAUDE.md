@@ -84,7 +84,6 @@ HTTP/SSE Client
 | `aiops-docs/` | Markdown files ingested as the default RAG knowledge base |
 
 ### Two Agent Patterns
-
 **RAG Agent** (`RagAgentService`): Standard ReAct loop using `ChatQwen` + LangGraph with `MemorySaver` for multi-turn conversation. Tools: `retrieve_knowledge`, `get_current_time`, plus all MCP tools loaded dynamically at init.
 
 **AIOps Agent** (`AIOpsService`): Plan-Execute-Replan loop — a `planner` node generates a step list, the `executor` node runs one step using MCP tools, and the `replanner` node either updates the plan or generates a final response. The graph exits when `state["response"]` is set.
@@ -110,7 +109,3 @@ Both agent types use `get_mcp_client_with_retry()` from `app/agent/mcp_client.py
 | `MCP_CLS_URL` | `http://localhost:8003/mcp` | CLS MCP endpoint |
 | `MCP_MONITOR_URL` | `http://localhost:8004/mcp` | Monitor MCP endpoint |
 | `DEBUG` | `false` | Enable hot-reload and debug mode |
-
-## Testing
-
-Tests live in `tests/` mirroring `app/` structure. Uses `pytest-asyncio` in auto mode. `pyproject.toml` configures coverage for the `app/` package by default, so `make test` always reports coverage. Use `make test-quick` to skip the coverage overhead during development.

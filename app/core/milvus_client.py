@@ -6,6 +6,8 @@ from pymilvus import (
     CollectionSchema,
     DataType,
     FieldSchema,
+    Function,
+    FunctionType,
     MilvusClient,
     connections,
     utility,
@@ -46,6 +48,7 @@ class MilvusClientManager:
 
     # 常量定义
     COLLECTION_NAME: str = "biz"
+    ENHANCED_COLLECTION_NAME: str = "biz_enhanced"  # Phase 2 增强集合
     VECTOR_DIM: int = 1024  # 统一使用 1024 维
     ID_MAX_LENGTH: int = 100
     CONTENT_MAX_LENGTH: int = 8000
@@ -55,6 +58,7 @@ class MilvusClientManager:
         """初始化 Milvus 客户端管理器"""
         self._client: MilvusClient | None = None
         self._collection: Collection | None = None
+        self._enhanced_collection: Collection | None = None  # Phase 2 集合句柄
 
     def connect(self) -> MilvusClient:
         """
@@ -125,6 +129,9 @@ class MilvusClientManager:
             # 加载 collection
             self._load_collection()
 
+            # 初始化 biz_enhanced collection（enhanced 模式所需）
+            self._init_enhanced_collection()
+
             return self._client
 
         except MilvusException as e:
@@ -141,10 +148,163 @@ class MilvusClientManager:
             raise RuntimeError(f"连接 Milvus 失败: {e}") from e
 
     def _collection_exists(self) -> bool:
-        """检查 collection 是否存在"""
+        """检查 biz collection 是否存在"""
         # pymilvus 的类型标注可能不准确，实际返回 bool
         result = utility.has_collection(self.COLLECTION_NAME)
         return bool(result)  # type: ignore[arg-type]
+
+    def _enhanced_collection_exists(self) -> bool:
+        """检查 biz_enhanced collection 是否存在"""
+        result = utility.has_collection(self.ENHANCED_COLLECTION_NAME)
+        return bool(result)  # type: ignore[arg-type]
+
+    def _init_enhanced_collection(self) -> None:
+        """初始化 biz_enhanced collection（幂等）"""
+        try:
+            if not self._enhanced_collection_exists():
+                logger.info(f"collection '{self.ENHANCED_COLLECTION_NAME}' 不存在，正在创建...")
+                self._create_enhanced_collection()
+                logger.info(f"成功创建 collection '{self.ENHANCED_COLLECTION_NAME}'")
+            else:
+                logger.info(f"collection '{self.ENHANCED_COLLECTION_NAME}' 已存在")
+                self._enhanced_collection = Collection(self.ENHANCED_COLLECTION_NAME)
+
+            self._load_enhanced_collection()
+        except Exception as e:
+            # enhanced collection 初始化失败不应阻断基础功能
+            logger.warning(f"biz_enhanced collection 初始化失败（enhanced 模式不可用）: {e}")
+
+    def _create_enhanced_collection(self) -> None:
+        """创建 biz_enhanced collection（双向量 schema + Milvus 内置 BM25）
+
+        Schema 设计：
+          - id            VARCHAR PK
+          - dense_vector  FLOAT_VECTOR(1024, COSINE)  — DashScope 嵌入
+          - content_text  VARCHAR(8000, analyzer=jieba) — BM25 输入字段
+          - sparse_vector SPARSE_FLOAT_VECTOR         — 由内置 BM25 Function 自动生成
+          - metadata      JSON                         — 文档元数据
+        """
+        fields = [
+            FieldSchema(
+                name="id",
+                dtype=DataType.VARCHAR,
+                max_length=self.ID_MAX_LENGTH,
+                is_primary=True,
+            ),
+            FieldSchema(
+                name="dense_vector",
+                dtype=DataType.FLOAT_VECTOR,
+                dim=self.VECTOR_DIM,
+            ),
+            # BM25 输入字段，需要启用分析器（Jieba 中文分词）
+            FieldSchema(
+                name="content_text",
+                dtype=DataType.VARCHAR,
+                max_length=self.CONTENT_MAX_LENGTH,
+                enable_analyzer=True,
+                analyzer_params={"type": "chinese"},  # Milvus 内置 Jieba 中文分析器
+            ),
+            # 稀疏向量由 BM25 Function 自动填充，无需客户端写入
+            FieldSchema(
+                name="sparse_vector",
+                dtype=DataType.SPARSE_FLOAT_VECTOR,
+            ),
+            FieldSchema(
+                name="metadata",
+                dtype=DataType.JSON,
+            ),
+        ]
+
+        # Milvus 内置 BM25：从 content_text 自动生成 sparse_vector
+        bm25_function = Function(
+            name="biz_bm25",
+            function_type=FunctionType.BM25,
+            input_field_names=["content_text"],
+            output_field_names=["sparse_vector"],
+        )
+
+        schema = CollectionSchema(
+            fields=fields,
+            functions=[bm25_function],
+            description="Business knowledge collection with hybrid dense+sparse vectors",
+            enable_dynamic_field=False,
+        )
+
+        self._enhanced_collection = Collection(
+            name=self.ENHANCED_COLLECTION_NAME,
+            schema=schema,
+            num_shards=self.DEFAULT_SHARD_NUMBER,
+        )
+
+        self._create_enhanced_index()
+
+    def _create_enhanced_index(self) -> None:
+        """为 biz_enhanced 的 dense_vector 和 sparse_vector 创建索引"""
+        if self._enhanced_collection is None:
+            raise RuntimeError("Enhanced Collection 未初始化")
+
+        # Dense 向量索引（COSINE + IVF_FLAT）
+        dense_index_params = {
+            "metric_type": "COSINE",
+            "index_type": "IVF_FLAT",
+            "params": {"nlist": 128},
+        }
+        _ = self._enhanced_collection.create_index(
+            field_name="dense_vector",
+            index_params=dense_index_params,
+        )
+        logger.info("成功为 dense_vector 创建索引（COSINE）")
+
+        # 稀疏向量索引（BM25 必须用 SPARSE_INVERTED_INDEX）
+        sparse_index_params = {
+            "metric_type": "BM25",
+            "index_type": "SPARSE_INVERTED_INDEX",
+        }
+        _ = self._enhanced_collection.create_index(
+            field_name="sparse_vector",
+            index_params=sparse_index_params,
+        )
+        logger.info("成功为 sparse_vector 创建索引（BM25 SPARSE_INVERTED_INDEX）")
+
+    def _load_enhanced_collection(self) -> None:
+        """加载 biz_enhanced collection 到内存"""
+        if self._enhanced_collection is None:
+            self._enhanced_collection = Collection(self.ENHANCED_COLLECTION_NAME)
+
+        try:
+            load_state = utility.load_state(self.ENHANCED_COLLECTION_NAME)
+            state_name = getattr(load_state, "name", str(load_state))
+            if state_name != "Loaded":
+                self._enhanced_collection.load()
+                logger.info(f"成功加载 collection '{self.ENHANCED_COLLECTION_NAME}'")
+            else:
+                logger.info(f"Collection '{self.ENHANCED_COLLECTION_NAME}' 已加载")
+        except AttributeError:
+            try:
+                self._enhanced_collection.load()
+                logger.info(f"成功加载 collection '{self.ENHANCED_COLLECTION_NAME}'")
+            except MilvusException as e:
+                error_msg = str(e).lower()
+                if "already loaded" in error_msg or "loaded" in error_msg:
+                    logger.info(f"Collection '{self.ENHANCED_COLLECTION_NAME}' 已加载")
+                else:
+                    raise
+        except Exception as e:
+            logger.error(f"加载 enhanced collection 失败: {e}")
+            raise
+
+    def get_enhanced_collection(self) -> Collection:
+        """获取 biz_enhanced collection 实例
+
+        Returns:
+            Collection: enhanced collection 实例
+
+        Raises:
+            RuntimeError: collection 未初始化时抛出
+        """
+        if self._enhanced_collection is None:
+            raise RuntimeError("Enhanced Collection 未初始化，请先调用 connect()")
+        return self._enhanced_collection
 
     def _create_collection(self) -> None:
         """创建 biz collection"""
@@ -277,13 +437,20 @@ class MilvusClientManager:
     def close(self) -> None:
         """关闭连接"""
         errors = []
-        
+
         try:
             if self._collection is not None:
                 self._collection.release()
                 self._collection = None
         except Exception as e:
             errors.append(f"释放 collection 失败: {e}")
+
+        try:
+            if self._enhanced_collection is not None:
+                self._enhanced_collection.release()
+                self._enhanced_collection = None
+        except Exception as e:
+            errors.append(f"释放 enhanced collection 失败: {e}")
 
         try:
             if connections.has_connection("default"):

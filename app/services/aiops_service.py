@@ -9,6 +9,7 @@ from langgraph.checkpoint.memory import MemorySaver
 from loguru import logger
 
 from app.agent.aiops import PlanExecuteState, planner, executor, replanner
+from app.config import config
 
 
 # 节点名称常量
@@ -22,7 +23,14 @@ class AIOpsService:
 
     def __init__(self):
         """初始化服务"""
-        self.checkpointer = MemorySaver()
+        # 创建检查点（Redis 或内存，用于会话管理）
+        if config.redis_url:
+            from langgraph.checkpoint.redis import RedisSaver
+            self.checkpointer = RedisSaver.from_conn_string(config.redis_url)
+            logger.info(f"AIOps 使用 RedisSaver: {config.redis_url}")
+        else:
+            self.checkpointer = MemorySaver()
+            logger.info("AIOps 使用 MemorySaver（进程内存）")
         self.graph = self._build_graph()
         logger.info("Plan-Execute-Replan Service 初始化完成")
 
@@ -145,6 +153,21 @@ class AIOpsService:
                 "message": "任务执行完成",
                 "response": final_response
             }
+
+            # 持久化诊断记录
+            try:
+                from app.services.diagnosis_store import get_diagnosis_store
+                store = get_diagnosis_store()
+                record_id = store.save(
+                    session_id=session_id,
+                    input_data=user_input,
+                    plan=final_state.values.get("plan", []) if final_state and final_state.values else [],
+                    past_steps=final_state.values.get("past_steps", []) if final_state and final_state.values else [],
+                    response=final_response,
+                )
+                logger.info(f"[会话 {session_id}] 诊断记录已保存: {record_id}")
+            except Exception as e:
+                logger.error(f"[会话 {session_id}] 保存诊断记录失败: {e}")
 
             logger.info(f"[会话 {session_id}] 任务执行完成")
 
