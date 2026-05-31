@@ -5,6 +5,7 @@ from typing import Any, Dict, List
 from loguru import logger
 from pymilvus import Collection
 
+from app.config import config
 from app.core.milvus_client import milvus_manager
 from app.services.vector_embedding_service import vector_embedding_service
 
@@ -65,10 +66,10 @@ class VectorSearchService:
             # 2. 获取 collection
             collection: Collection = milvus_manager.get_collection()
 
-            # 3. 构建搜索参数
+            # 3. 构建搜索参数（P0-1.3: nprobe 可配置，默认 32 提升召回率）
             search_params = {
                 "metric_type": "L2",  # 欧氏距离
-                "params": {"nprobe": 10},
+                "params": {"nprobe": config.milvus_nprobe},
             }
 
             # 4. 执行搜索

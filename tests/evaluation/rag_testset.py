@@ -109,7 +109,7 @@ from typing import List, Optional
 # ---------------------------------------------------------------------------
 # 数据集版本号 — 修改测试集内容后递增
 # ---------------------------------------------------------------------------
-DATASET_VERSION = "1.1.2"
+DATASET_VERSION = "1.2.0"
 
 
 @dataclass
@@ -117,11 +117,14 @@ class EvalSample:
     """单条评估样本的数据契约
 
     Attributes:
-        question:       用户查询文本（必填）
-        ground_truths:  期望参考答案要点列表（必填）
-        relevant_docs:  相关源文档文件名列表（必填），如 ["cpu_high_usage.md"]
-        category:       问题分类标签，用于分组统计
-        reference_docs: 参考文档来源（可选）
+        question:                 用户查询文本（必填）
+        ground_truths:            期望参考答案要点列表（必填），3-5 个要点
+        relevant_docs:            相关源文档文件名列表（必填），如 ["cpu_high_usage.md"]
+        category:                 问题分类标签，用于分组统计
+        reference_docs:           参考文档来源（可选）
+        gen_expected_facts:       生成评估：答案必须包含的关键事实（可选，若空则 fallback 到 ground_truths）
+        gen_forbidden_content:    生成评估：答案不应包含的内容（可选，用于幻觉检测）
+        gen_min_length:           生成评估：最小期望答案长度（字符数），0=不检查
     """
 
     question: str
@@ -129,6 +132,9 @@ class EvalSample:
     relevant_docs: List[str] = field(default_factory=list)
     category: str = "exact_keyword"
     reference_docs: List[str] = field(default_factory=list)
+    gen_expected_facts: List[str] = field(default_factory=list)
+    gen_forbidden_content: List[str] = field(default_factory=list)
+    gen_min_length: int = 0
 
 
 def validate_testset(samples: List[EvalSample]) -> List[str]:
@@ -186,6 +192,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cpu_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            "使用 top -c 按 CPU 使用率排序查看进程",
+            "使用 ps 命令获取 Top 10 CPU 进程",
+            "使用 pidstat 获取进程实时 CPU 统计",
+        ],
     ),
     EvalSample(
         question="CPU飙高可能是代码里写了死循环吗？",
@@ -215,6 +226,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cpu_high_usage.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            "数据库查询慢会导致应用线程阻塞和上下文切换频繁",
+            "上下文切换频繁会使 CPU 使用率升高",
+            "应通知 DBA 排查慢查询",
+            "可在应用侧紧急降级非核心查询",
+        ],
     ),
     EvalSample(
         question="排查 CPU 问题时怎么看应用日志有没有报错？",
@@ -239,6 +256,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["disk_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            "使用 df -h 查看各分区使用情况",
+            "使用 du -sh * | sort -hr 找出占用空间最大的目录",
+            "使用 find 命令查找大于 500MB 的大文件",
+        ],
     ),
     EvalSample(
         question="日志把磁盘写满了，可以直接清空吗？怎么操作？",
@@ -268,6 +290,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["disk_high_usage.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            "压缩旧的大文件，使用 gzip 命令",
+            "排查并清理 /tmp 或 /var/tmp 临时文件目录",
+            "暂停非紧急的大文件传输或导入批处理任务",
+        ],
     ),
     EvalSample(
         question="如果磁盘 inode 被占满了怎么排查？",
@@ -278,6 +305,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["disk_high_usage.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            "使用 df -i 命令查看 inode 使用情况",
+            "inode 耗尽通常是因为大量小文件",
+            "即使磁盘空间有剩余，inode 满也会导致无法创建新文件",
+            "需要查找并清理包含大量小文件的目录",
+        ],
     ),
 
     # ---------------------------------------------
@@ -292,6 +325,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["memory_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            "使用 jmap -dump:live,format=b,file=heap.bin <PID> 生成堆转储文件",
+            "使用 MAT 或 JProfiler 进行离线分析",
+            "通过分析大对象或实例数最多的类定位内存泄漏",
+        ],
     ),
     EvalSample(
         question="OOM是不是因为缓存配置不对？",
@@ -302,6 +340,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["memory_high_usage.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            "缓存配置不当是 OOM 的可能原因之一",
+            "本地缓存（Guava Cache、Caffeine）未设置过期时间或最大容量会导致内存无限增长",
+            "一次性加载过大的缓存预热数据也会导致 OOM",
+        ],
     ),
     EvalSample(
         question="大文件处理会导致内存高吗？",
@@ -332,6 +375,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["memory_high_usage.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            "使用 jstat -gcutil <PID> 1000 查看实时 GC 和堆内存使用比例",
+            "使用 jmap -heap <PID> 查看堆内存配置和使用详情",
+            "频繁 Full GC 说明老年代内存不足或存在内存泄漏",
+        ],
     ),
 
     # ---------------------------------------------
@@ -346,6 +394,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["service_unavailable.md"],
         category="colloquial",
+        gen_expected_facts=[
+            "使用 ps -ef | grep 检查服务进程是否存在",
+            "使用 netstat -tlnp | grep 检查监听端口是否正常",
+            "进程存在但端口不通可能是线程池耗尽或死锁",
+        ],
     ),
     EvalSample(
         question="服务不可用可能是因为数据库连不上吗？",
@@ -399,6 +452,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["slow_response.md"],
         category="colloquial",
+        gen_expected_facts=[
+            "登录数据库管理平台或监控大盘查看慢 SQL 统计",
+            "在应用日志中搜索 Slow query 或耗时较长的 SQL 记录",
+            "对疑似慢 SQL 执行 EXPLAIN 查看执行计划",
+            "确认是否命中索引或发生了全表扫描",
+        ],
     ),
     EvalSample(
         question="缓存击穿会导致接口变慢吗？",
@@ -449,6 +508,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cpu_high_usage.md", "memory_high_usage.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            "代码问题特征：单进程 CPU 接近 100%（死循环）、内存持续缓慢上升且 Full GC 后无法释放",
+            "流量突增特征：多个进程 CPU 随流量均匀升高、内存随请求量突然升高",
+            "代码问题应保留日志和堆转储后回滚或修复",
+            "流量突增应扩容并启用限流保护",
+        ],
     ),
     EvalSample(
         question="服务不可用同时 API 5xx 飙升，第一轮排查怎么做？",
@@ -459,6 +524,13 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["service_unavailable.md", "api_error_rate_spike.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            "先确认健康检查失败或错误率超过 50%",
+            "查询最近 15-30 分钟的 ERROR/FATAL/status:500 日志",
+            "检索 api-gateway-logs 中 level:ERROR 或 status:5xx 的日志",
+            "检查依赖服务、配置变更、网络连接和发布回滚",
+            "先止损再定位根因",
+        ],
     ),
     EvalSample(
         question="网络延迟高导致接口变慢时，要同时看哪些指标和日志？",
@@ -469,6 +541,13 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["network_high_latency.md", "slow_response.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            "查询 network-metrics 中 latency > 500 的服务对",
+            "从应用日志确认 RPC 超时和受影响调用",
+            "检查 response_time > 3000 或 slow_query 日志及数据库慢查询",
+            "结合 CPU、内存、网络延迟、下游超时和慢 SQL 综合判断瓶颈",
+            "必要时降级非核心调用并调整超时配置",
+        ],
     ),
     EvalSample(
         question="数据库连接池满了以后接口响应慢，应该怎么联动排查？",
@@ -479,6 +558,13 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md", "slow_response.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            "检查活跃连接数、空闲连接数、等待队列长度",
+            "查询 database_connection_error 或 connection_timeout 日志",
+            "慢 SQL、数据库 CPU 高和连接池满载都会导致 P99 响应超阈值",
+            "先释放或扩容连接、启用限流",
+            "再优化慢查询、添加索引或调整连接池配置",
+        ],
     ),
     EvalSample(
         question="缓存雪崩发展成服务不可用时，应该先恢复缓存还是先做降级？",
@@ -489,6 +575,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cache_avalanche.md", "service_unavailable.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            "应并行止损而非串行等待",
+            "对外降级或切流保护核心链路",
+            "同时恢复缓存、预热热点数据",
+            "限制数据库压力并检查应用错误日志",
+        ],
     ),
 
     # -------------------------------------------------------
@@ -660,6 +752,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md", "network_high_latency.md"],
         category="edge_case",
+        gen_expected_facts=[
+            "网络延迟高不会直接影响 SSL 证书的有效性",
+            "高延迟可能导致 SSL 握手过程变慢",
+            "应检查网络状况并优化网络配置",
+        ],
     ),
     EvalSample(
         question="ContainerOOMKilled 告警的触发条件是什么？",
@@ -711,6 +808,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["container_oom_killed.md", "database_connection_pool_exhaustion.md"],
         category="edge_case",
+        gen_expected_facts=[
+            "数据库连接池耗尽通常不会直接导致容器内存问题",
+            "连接等待队列堆积会间接增加应用线程数和内存占用",
+            "需同时检查连接池状态和容器内存使用情况交叉确认",
+        ],
     ),
     EvalSample(
         question="DatabaseConnectionPoolExhaustion 告警的触发条件是什么？",
@@ -805,6 +907,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["message_queue_backlog.md"],
         category="edge_case",
+        gen_expected_facts=[
+            "消息队列 Broker 需要磁盘存储消息",
+            "磁盘满会直接导致消息写入失败",
+            "磁盘 IO 繁忙会拖慢消息写入和消费速度",
+            "应查询消息队列日志中是否有磁盘空间不足或 IO 超时错误",
+        ],
     ),
     EvalSample(
         question="MessageQueueBacklog 告警的触发条件是什么？",
@@ -825,6 +933,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md", "slow_response.md"],
         category="edge_case",
+        gen_expected_facts=[
+            "证书未过期时通常不会直接阻断接口调用",
+            "握手和校验过程可能变慢",
+            "证书链不完整或客户端严格校验可能导致 TLS 握手失败",
+            "应尽快续签并更新证书",
+        ],
     ),
     EvalSample(
         question="NetworkHighLatency 告警的触发条件是什么？",
@@ -877,6 +991,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md", "network_high_latency.md"],
         category="edge_case",
+        gen_expected_facts=[
+            "连接池耗尽导致应用线程阻塞等待连接，间接增加请求延迟",
+            "大量阻塞线程可能占满应用线程池",
+            "线程池满会导致新的网络请求无法被处理",
+            "需通过应用日志确认连接等待时长",
+        ],
     ),
 ]
 
@@ -889,7 +1009,8 @@ def get_eval_dataset():
       - ground_truth  (str) — 多个 ground_truths 通过 "\n" 拼接为单个字符串
 
     Returns:
-        datasets.Dataset: 包含 question, ground_truth, category, relevant_docs 的 Dataset
+        datasets.Dataset: 包含 question, ground_truth, category, relevant_docs,
+                           gen_expected_facts, gen_forbidden_content, gen_min_length 的 Dataset
     """
     from datasets import Dataset
 
@@ -897,16 +1018,28 @@ def get_eval_dataset():
     ground_truths = []
     categories = []
     relevant_docs_list = []
+    gen_expected_facts_list = []
+    gen_forbidden_content_list = []
+    gen_min_length_list = []
 
     for s in EVALUATION_DATASET:
         questions.append(s.question)
         ground_truths.append("\n".join(s.ground_truths))
         categories.append(s.category)
         relevant_docs_list.append(s.relevant_docs)
+        # 生成评估字段：若未标注 gen_expected_facts 则 fallback 到 ground_truths
+        gen_expected_facts_list.append(
+            s.gen_expected_facts if s.gen_expected_facts else s.ground_truths
+        )
+        gen_forbidden_content_list.append(s.gen_forbidden_content)
+        gen_min_length_list.append(s.gen_min_length)
 
     return Dataset.from_dict({
         "question": questions,
         "ground_truth": ground_truths,
         "category": categories,
         "relevant_docs": relevant_docs_list,
+        "gen_expected_facts": gen_expected_facts_list,
+        "gen_forbidden_content": gen_forbidden_content_list,
+        "gen_min_length": gen_min_length_list,
     })

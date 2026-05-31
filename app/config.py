@@ -25,14 +25,23 @@ class Settings(BaseSettings):
     port: int = 9900
 
     # DashScope 配置
-    dashscope_api_key: str = ""  # 默认空字符串，实际使用需从环境变量加载
+    dashscope_api_key: str = ""  # 默认空，实际从.env加载
+    dashscope_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_model: str = "qwen-max"
-    dashscope_embedding_model: str = "text-embedding-v4"  # v4 支持多种维度（默认 1024）
+    dashscope_embedding_model: str = "text-embedding-v4"
+
+    # LLM 统一调用配置（P0-1.1: 收敛所有硬编码参数）
+    llm_temperature: float = 0.0        # 默认温度（规划/执行类节点使用 0，对话类可覆盖）
+    llm_chat_temperature: float = 0.7   # 对话 Agent 专用温度
+    llm_timeout: int = 60               # API 调用超时（秒）
+    llm_max_retries: int = 2            # 最大重试次数
+    llm_fallback_model: str = "qwen-plus"  # Fallback 模型（P0-1.2），为空则不启用
 
     # Milvus 配置
     milvus_host: str = "localhost"
     milvus_port: int = 19530
     milvus_timeout: int = 10000  # 毫秒
+    milvus_nprobe: int = 32     # 搜索 nprobe（P0-1.3: 10→32 提升召回率）
 
     # ------------------------------------------------------------------
     # RAG 检索配置（三层语义）
@@ -56,7 +65,7 @@ class Settings(BaseSettings):
     reranker_type: Literal["none", "cross_encoder"] = "cross_encoder"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_top_k: int = 3          # enhanced 模式最终返回数（精排后截断）
-    rerank_coarse_top_k: int = 20    # enhanced 模式粗排候选数（供精排器输入）
+    rerank_coarse_top_k: int = 10    # enhanced 模式粗排候选数（P0-1.3: 20→10 精排耗时减半）
 
     # ------------------------------------------------------------------
     # 评估 Judge 配置（独立于线上 RAG 模型，确保评估可复现）

@@ -19,9 +19,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from loguru import logger
 from typing_extensions import TypedDict
-from langchain_qwq import ChatQwen
 
 from app.config import config
+from app.core.llm_factory import create_chat_qwen_for_chat
 from app.tools import get_current_time, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
 
@@ -94,13 +94,8 @@ class RagAgentService:
         self.streaming = streaming
         self.system_prompt = self._build_system_prompt()
 
-
-        self.model = ChatQwen(
-            model=self.model_name,
-            api_key=config.dashscope_api_key,
-            temperature=0.7,
-            streaming=streaming,
-        )
+        # P0-1.1: 使用统一工厂创建对话 LLM（默认 temperature=0.7, streaming=True）
+        self.model = create_chat_qwen_for_chat(streaming=streaming)
 
         # 定义基础工具
         self.tools = [retrieve_knowledge, get_current_time]
@@ -110,9 +105,24 @@ class RagAgentService:
 
         # 创建检查点（Redis 或内存，用于会话管理）
         if config.redis_url:
-            from langgraph.checkpoint.redis import RedisSaver
-            self.checkpointer = RedisSaver.from_conn_string(config.redis_url)
-            logger.info(f"使用 RedisSaver: {config.redis_url}")
+            try:
+                from langgraph.checkpoint.redis import RedisSaver
+                from langgraph.checkpoint.base import BaseCheckpointSaver
+                maybe_saver = RedisSaver.from_conn_string(config.redis_url)
+                if isinstance(maybe_saver, BaseCheckpointSaver):
+                    self.checkpointer = maybe_saver
+                    logger.info(f"使用 RedisSaver: {config.redis_url}")
+                else:
+                    logger.warning(
+                        f"RedisSaver.from_conn_string 返回了 {type(maybe_saver)}，"
+                        f"可能需要 async context manager。回退到 MemorySaver。"
+                    )
+                    self.checkpointer = MemorySaver()
+                    logger.info("使用 MemorySaver（进程内存）")
+            except Exception as e:
+                logger.warning(f"RedisSaver 初始化失败 ({e})，回退到 MemorySaver")
+                self.checkpointer = MemorySaver()
+                logger.info("使用 MemorySaver（进程内存）")
         else:
             self.checkpointer = MemorySaver()
             logger.info("使用 MemorySaver（进程内存）")
@@ -313,8 +323,14 @@ class RagAgentService:
             answer: str = ""
             for msg in reversed(messages_result):
                 content = msg.content if hasattr(msg, "content") else str(msg)
-                if content and content.strip():
-                    answer = content
+                # content 可能是 list（多模态消息），需转为 str
+                if isinstance(content, list):
+                    content = " ".join(
+                        item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                        for item in content
+                    )
+                if content and str(content).strip():
+                    answer = str(content)
                     break
 
             logger.info(

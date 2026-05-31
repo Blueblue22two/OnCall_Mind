@@ -31,33 +31,29 @@ from typing import Any, Optional
 from loguru import logger
 
 
-def _build_llm_wrapper():
-    """构建 RAGAs 需要的 LLM 包装器。
+def _build_judge_llm():
+    """构建 Goal Accuracy 需要的 LangChain LLM。
 
     Judge 使用独立的 eval_judge_* 配置，与线上 RAG 模型解耦，确保评估可复现。
-    复用 evaluate_rag.py 中相同的构建方式。
+    使用 ChatQwen（OpenAI 兼容模式），支持 ainvoke 异步调用。
     """
     try:
-        from ragas.llms import LangchainLLMWrapper
-        from langchain_community.chat_models import ChatTongyi
+        from langchain_qwq import ChatQwen
         from app.config import config
 
-        llm_kwargs: dict[str, Any] = {
-            "model": config.eval_judge_model,
-            "temperature": config.eval_judge_temperature,
-            "dashscope_api_key": config.eval_judge_api_key or config.dashscope_api_key,
-        }
-        judge_api_base = config.eval_judge_api_base
-        if judge_api_base:
-            llm_kwargs["dashscope_api_base"] = judge_api_base
+        api_key = config.eval_judge_api_key or config.dashscope_api_key
+        api_base = config.eval_judge_api_base or config.dashscope_api_base
 
-        llm = ChatTongyi(**llm_kwargs)
-        ragas_llm = LangchainLLMWrapper(llm)
-        return ragas_llm
+        llm = ChatQwen(
+            model=config.eval_judge_model,
+            temperature=config.eval_judge_temperature,
+            api_key=api_key,
+            api_base=api_base,
+        )
+        return llm
 
     except ImportError as e:
-        logger.error(f"RAGAs 依赖未安装: {e}")
-        logger.error("请运行: pip install 'ragas>=0.2.0'")
+        logger.error(f"依赖未安装: {e}")
         sys.exit(1)
 
 
@@ -240,7 +236,7 @@ async def run_agent_evaluation(
     # 2. 构建 LLM Judge
     judge_llm = None
     if not skip_goal:
-        judge_llm = _build_llm_wrapper()
+        judge_llm = _build_judge_llm()
 
     # 3. 逐条执行 Agent
     per_case: list[dict[str, Any]] = []
