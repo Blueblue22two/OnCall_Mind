@@ -65,9 +65,10 @@ uploads/
 .DS_Store
 Thumbs.db
 
-# Evaluation & Diagnosis reports
+# Evaluation, Diagnosis & Trace reports
 reports/
 diagnosis_reports/
+agent_traces/
 
 # Pytest
 .pytest_cache/
@@ -81,4 +82,10 @@ dmypy.json
 
 # Ruff
 .ruff_cache/
+
+# Project Docs
+Project Docs/
+
+# Claude
+CLAUDE.md
 

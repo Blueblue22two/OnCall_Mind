@@ -14,12 +14,16 @@
   # 包含生成评估（faithfulness + answer_relevancy，需 Agent 生成 answer）
   RAG_MODE=basic python -m tests.evaluation.evaluate_rag --with-generation
 
+  # 完整生成评估（含 answer_correctness）
+  RAG_MODE=basic python -m tests.evaluation.evaluate_rag --with-generation --generation-metrics full
+
   # 指定输出路径
   RAG_MODE=basic python -m tests.evaluation.evaluate_rag --output reports/basic.json
 
 评估指标（两阶段）：
   Phase 1 - 检索评估：context_precision, context_recall
   Phase 2 - 生成评估：faithfulness, answer_relevancy（需要 --with-generation）
+            --generation-metrics full 时额外包含 answer_correctness
 
 目标基线（basic 模式）：context_precision ≥ 0.70, context_recall ≥ 0.70
 Enhanced 模式目标：      context_precision ≥ 0.80, context_recall ≥ 0.80
@@ -270,6 +274,7 @@ def run_evaluation(
     output_path: Optional[str] = None,
     with_generation: bool = False,
     output_format: str = "json",
+    generation_metrics_mode: str = "minimal",
 ) -> dict:
     """执行分阶段 RAGAs 评估
 
@@ -278,10 +283,13 @@ def run_evaluation(
         检索 contexts → 评估 context_precision + context_recall
       Phase 2（生成评估）— 仅在 --with-generation 时执行
         Agent 生成 answer → 评估 faithfulness + answer_relevancy
+        --generation-metrics full 时额外评估 answer_correctness
 
     Args:
         output_path: 可选，结果输出 JSON 文件路径
         with_generation: 是否执行 Phase 2 生成评估
+        output_format: 输出格式 ("json", "csv", "both")
+        generation_metrics_mode: 生成指标范围 ("minimal" | "full")
 
     Returns:
         dict: 包含分组指标、逐题明细、分类统计的完整评估结果
@@ -310,6 +318,7 @@ def run_evaluation(
             context_recall,
             faithfulness,
             answer_relevancy,
+            answer_correctness,
         )
     except ImportError as e:
         logger.error(f"RAGAs 依赖未安装: {e}")
@@ -330,7 +339,10 @@ def run_evaluation(
     logger.info(f"  top_k:          {effective_top_k}")
     logger.info(f"  Judge 模型:     {config.eval_judge_model}")
     logger.info(f"  Judge 温度:     {config.eval_judge_temperature}")
-    logger.info(f"  生成评估:       {'开启' if with_generation else '关闭（仅检索指标）'}")
+    gen_label = "关闭（仅检索指标）"
+    if with_generation:
+        gen_label = f"开启（{'完整' if generation_metrics_mode == 'full' else '基础'}指标）"
+    logger.info(f"  生成评估:       {gen_label}")
     logger.info(f"  数据集版本:     {DATASET_VERSION}")
     logger.info("=" * 60)
 
@@ -443,9 +455,13 @@ def run_evaluation(
             })
 
             try:
+                gen_metrics_list = [faithfulness, answer_relevancy]
+                if generation_metrics_mode == "full":
+                    gen_metrics_list.append(answer_correctness)
+
                 gen_result = evaluate(
                     dataset=generation_dataset,
-                    metrics=[faithfulness, answer_relevancy],
+                    metrics=gen_metrics_list,
                     llm=ragas_llm,
                     embeddings=ragas_embeddings,
                     raise_exceptions=False,
@@ -462,8 +478,15 @@ def run_evaluation(
                     "answers_generated": answers_generated,
                     "answers_failed": answers_failed,
                 }
+                if generation_metrics_mode == "full":
+                    generation_metrics["answer_correctness"] = _coerce_metric_score(
+                        gen_result["answer_correctness"],
+                        "answer_correctness",
+                    )
                 logger.info(f"  faithfulness      : {generation_metrics['faithfulness']:.4f}")
                 logger.info(f"  answer_relevancy  : {generation_metrics['answer_relevancy']:.4f}")
+                if generation_metrics_mode == "full":
+                    logger.info(f"  answer_correctness: {generation_metrics['answer_correctness']:.4f}")
             except Exception as e:
                 logger.error(f"Phase 2 生成评估失败: {e}")
                 generation_metrics = {
@@ -519,6 +542,8 @@ def run_evaluation(
         logger.info(f"  [生成指标]")
         logger.info(f"    faithfulness      : {generation_metrics['faithfulness']:.4f}")
         logger.info(f"    answer_relevancy  : {generation_metrics['answer_relevancy']:.4f}")
+        if generation_metrics.get("answer_correctness") is not None:
+            logger.info(f"    answer_correctness: {generation_metrics['answer_correctness']:.4f}")
         logger.info(f"    answer 生成: {generation_metrics['answers_generated']}/{len(questions)}"
                     f" (+{generation_metrics['answers_failed']} 失败)")
 
@@ -576,10 +601,19 @@ if __name__ == "__main__":
         default=False,
         help="启用 Phase 2 生成评估（Agent 生成 answer，评估 faithfulness + answer_relevancy）",
     )
+    parser.add_argument(
+        "--generation-metrics",
+        type=str,
+        choices=["minimal", "full"],
+        default="minimal",
+        dest="generation_metrics_mode",
+        help="生成指标范围: minimal=faithfulness+answer_relevancy, full=+answer_correctness (default: minimal)",
+    )
     args = parser.parse_args()
 
     run_evaluation(
         output_path=args.output,
         with_generation=args.with_generation,
         output_format=args.output_format,
+        generation_metrics_mode=args.generation_metrics_mode,
     )

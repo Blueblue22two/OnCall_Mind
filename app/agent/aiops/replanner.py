@@ -3,16 +3,18 @@ Replanner 节点：重新规划或生成最终响应
 基于 LangGraph 官方教程实现
 """
 
+import time
 from textwrap import dedent
 from typing import Dict, Any, List
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_qwq import ChatQwen
 from pydantic import BaseModel, Field
 from loguru import logger
 
 from app.config import config
+from app.core.llm_factory import create_chat_qwen
 from app.tools import get_current_time, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.services.trace_store import get_trace_store, extract_token_usage
 from .state import PlanExecuteState
 from .utils import format_tools_description
 
@@ -122,19 +124,24 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
     input_text = state.get("input", "")
     plan = state.get("plan", [])
     past_steps = state.get("past_steps", [])
+    trace_id = state.get("trace_id", "")
+    error_count = state.get("error_count", 0)
 
     logger.info(f"剩余计划步骤: {len(plan)}")
     logger.info(f"已执行步骤: {len(past_steps)}")
+
+    # P1-2.2: 检查错误计数 — 超过阈值自动 respond
+    MAX_ERRORS = state.get("max_errors", 3)
+    if error_count >= MAX_ERRORS:
+        logger.warning(f"累计错误 {error_count} >= {MAX_ERRORS}，强制生成响应")
+        llm = create_chat_qwen(temperature=0)
+        return await _generate_response(state, llm)
 
     # ⚠️ 强制限制：如果已执行步骤过多，直接生成响应
     MAX_STEPS = 8
     if len(past_steps) >= MAX_STEPS:
         logger.warning(f"已执行 {len(past_steps)} 个步骤，超过最大限制 {MAX_STEPS}，强制生成最终响应")
-        llm = ChatQwen(
-            model=config.rag_model,
-            api_key=config.dashscope_api_key,
-            temperature=0
-        )
+        llm = create_chat_qwen(temperature=0)
         return await _generate_response(state, llm)
 
     # 获取可用工具列表
@@ -159,12 +166,8 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
         logger.warning(f"获取工具列表失败: {e}")
         tools_description = "无法获取工具列表"
 
-    # 创建 LLM
-    llm = ChatQwen(
-        model=config.rag_model,
-        api_key=config.dashscope_api_key,
-        temperature=0
-    )
+    # 创建 LLM（P0-1.1: 使用统一工厂）
+    llm = create_chat_qwen(temperature=0)
 
     # 格式化已执行的步骤
     steps_summary = "\n".join([
@@ -186,43 +189,50 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
                 ("user", f"⚠️ 重要提示：已执行 {len(past_steps)} 个步骤，请优先考虑是否信息已足够生成响应（respond）")
             ]
 
+            t_replan = time.monotonic()
             act = await replanner_chain.ainvoke({
                 "messages": messages,
                 "tools_description": tools_description
             })
+            replan_token_usage = extract_token_usage(act)
 
-            # 处理返回结果
             if isinstance(act, Act):
                 action = act.action
                 new_steps = act.new_steps
             else:
-                # 如果返回的是字典
                 action = act.get("action", "continue")  # type: ignore
                 new_steps = act.get("new_steps", [])  # type: ignore
 
             logger.info(f"Replanner 决策: {action}")
+
+            # P1-2.1: 保存 replanner 决策 trace
+            _save_node_trace(trace_id, f"replanner_{len(past_steps)}", {
+                "step_count": len(past_steps),
+                "decision": action,
+                "new_steps": new_steps if action == "replan" else [],
+                "token_usage": replan_token_usage,
+                "duration_ms": int((time.monotonic() - t_replan) * 1000),
+                "status": "success",
+            })
 
             if action == "respond":
                 logger.info("决定生成最终响应")
                 return await _generate_response(state, llm)
 
             elif action == "replan":
-                # ⚠️ 强制限制：新步骤数不能超过当前剩余步骤数
                 if len(new_steps) > len(plan):
                     logger.warning(
                         f"新步骤数 {len(new_steps)} > 剩余步骤数 {len(plan)}，"
                         f"强制截断为 {len(plan)} 个步骤"
                     )
                     new_steps = new_steps[:len(plan)]
-                
-                # ⚠️ 二次检查：如果已执行步骤 >= 5，禁止 replan
+
                 if len(past_steps) >= 5:
                     logger.warning(f"已执行 {len(past_steps)} 个步骤，禁止重新规划，强制生成响应")
                     return await _generate_response(state, llm)
-                
+
                 logger.info(f"决定调整计划，新步骤数量: {len(new_steps)}")
                 if new_steps:
-                    # 替换剩余计划
                     return {"plan": new_steps}
                 else:
                     logger.warning("replan 但未提供新步骤，继续执行原计划")
@@ -230,10 +240,18 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
 
             else:  # action == "continue"
                 logger.info("决定继续执行当前计划")
-                return {}  # 不修改状态，继续执行
+                return {}
 
         except Exception as e:
             logger.error(f"重新规划失败: {e}, 继续执行剩余计划")
+            _save_node_trace(trace_id, f"replanner_{len(past_steps)}", {
+                "step_count": len(past_steps),
+                "decision": "error",
+                "token_usage": {},
+                "duration_ms": 0,
+                "status": "error",
+                "error": str(e),
+            })
             return {}
 
     else:
@@ -242,20 +260,22 @@ async def replanner(state: PlanExecuteState) -> Dict[str, Any]:
         return await _generate_response(state, llm)
 
 
-async def _generate_response(state: PlanExecuteState, llm: ChatQwen) -> Dict[str, Any]:
+async def _generate_response(state: PlanExecuteState, llm) -> Dict[str, Any]:
     """生成最终响应"""
     logger.info("生成最终响应...")
 
     input_text = state.get("input", "")
     past_steps = state.get("past_steps", [])
+    trace_id = state.get("trace_id", "")
 
-    # 格式化执行历史
     execution_history = "\n\n".join([
         f"### 步骤: {step}\n**结果:**\n{result}"
         for step, result in past_steps
     ])
 
     response_gen = response_prompt | llm.with_structured_output(Response)
+
+    t_response = time.monotonic()
 
     try:
         messages = [
@@ -265,21 +285,34 @@ async def _generate_response(state: PlanExecuteState, llm: ChatQwen) -> Dict[str
         ]
 
         response_obj = await response_gen.ainvoke({"messages": messages})
+        response_token_usage = extract_token_usage(response_obj)
 
-        # 处理返回结果
         if isinstance(response_obj, Response):
             final_response = response_obj.response
         else:
-            # 如果返回的是字典
             final_response = response_obj.get("response", "")  # type: ignore
 
         logger.info(f"最终响应生成完成，长度: {len(final_response)}")
+
+        # P1-2.1: 保存最终响应 trace
+        _save_node_trace(trace_id, "final_response", {
+            "token_usage": response_token_usage,
+            "duration_ms": int((time.monotonic() - t_response) * 1000),
+            "response_length": len(final_response),
+            "status": "success",
+        })
 
         return {"response": final_response}
 
     except Exception as e:
         logger.error(f"生成响应失败: {e}")
-        # 生成简单的后备响应
+        # P1-2.1: 记录失败
+        _save_node_trace(trace_id, "final_response", {
+            "token_usage": {},
+            "duration_ms": int((time.monotonic() - t_response) * 1000),
+            "status": "error",
+            "error": str(e),
+        })
         fallback_response = f"""# 任务执行结果
 
 ## 原始任务
@@ -305,3 +338,13 @@ def _format_simple_steps(past_steps: list) -> str:
         formatted.append(f"{i}. **{step}**\n   {result_preview}\n")
 
     return "\n".join(formatted)
+
+
+def _save_node_trace(trace_id: str, node_name: str, data: dict) -> None:
+    """保存单个节点的 trace 数据（P1-2.1）。"""
+    if not trace_id:
+        return
+    try:
+        get_trace_store().save_node_trace(trace_id, node_name, data)
+    except Exception as e:
+        logger.warning(f"保存节点 trace 失败 ({node_name}): {e}")

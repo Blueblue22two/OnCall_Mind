@@ -23,6 +23,14 @@ class PlanExecuteState(TypedDict, total=False):
     # 最终响应/报告
     response: str
 
+    # --- P1-2.1: Agent Eval Trace ---
+    trace_id: str                   # Trace 唯一标识，贯穿整个工作流
+
+    # --- P1-2.2: Error Handler 字段 ---
+    error_count: int                # 累计错误次数
+    max_errors: int                 # 错误上限（默认 3）
+    last_error: str                 # 最近一次错误信息
+
     # 为 HITL 预留的字段
     pending_approval: bool
     pending_tool_name: str

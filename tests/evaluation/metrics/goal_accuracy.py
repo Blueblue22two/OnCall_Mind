@@ -88,7 +88,7 @@ async def compute_goal_accuracy(
     user_question: str,
     expected_conclusion_contains: list[str],
     agent_output: str,
-    judge_llm: Any,  # LangchainLLMWrapper from ragas
+    judge_llm: Any,  # LangChain LLM (e.g. ChatTongyi) with ainvoke support
     num_trials: int = 3,
 ) -> dict[str, Any]:
     """对单个测试用例的 Agent 输出进行 0/1/2 评分。
@@ -99,7 +99,7 @@ async def compute_goal_accuracy(
         user_question: 用户的原始输入。
         expected_conclusion_contains: 期望结论应包含的要点列表。
         agent_output: Agent 的最终输出文本。
-        judge_llm: RAGAs 的 LangchainLLMWrapper 实例，用于调用 Judge 模型。
+        judge_llm: LangChain LLM 实例（需支持 ainvoke），如 ChatTongyi。
         num_trials: 独立评分次数，默认 3 次。
 
     Returns:

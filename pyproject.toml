@@ -1,7 +1,7 @@
 [project]
-name = "super-biz-agent-py"
+name = "oncall-mind"
 version = "1.2.1"
-description = "基于 LangChain 的智能业务代理系统 - 支持 RAG 知识库和 AIOps 智能运维"
+description = "OnCall Mind — 基于 LangChain 的智能 On-Call 运维 Agent，支持 RAG 知识库和 AIOps 故障诊断"
 authors = [{name = "chief"}]
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -31,6 +31,9 @@ dependencies = [
     "fastmcp>=2.14.0",
     "langchain-qwq>=0.3.4",
     "pypdf>=3.0.0",
+    "prometheus_client>=0.17.0",     # Prometheus 监控指标
+    "mcp>=1.0.0",                    # MCP 协议类型定义
+    "typing_extensions>=4.0.0",      # 类型扩展支持
     # Enhanced RAG 依赖（rag_mode="enhanced" 时使用）
     "FlagEmbedding>=1.2.0",     # Cross-Encoder 精排（bge-reranker-v2-m3）
     # RAG 评估依赖
@@ -51,6 +54,7 @@ dev = [
     "pre-commit>=3.6.0",
     "ipython>=8.20.0",
     "ipdb>=0.13.13",
+    "numpy>=1.24.0",      # 评估指标计算
 ]
 
 [build-system]

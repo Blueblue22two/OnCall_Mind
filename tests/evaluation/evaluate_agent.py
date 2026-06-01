@@ -31,39 +31,38 @@ from typing import Any, Optional
 from loguru import logger
 
 
-def _build_llm_wrapper():
-    """构建 RAGAs 需要的 LLM 包装器。
+def _build_judge_llm():
+    """构建 Goal Accuracy 需要的 LangChain LLM。
 
     Judge 使用独立的 eval_judge_* 配置，与线上 RAG 模型解耦，确保评估可复现。
-    复用 evaluate_rag.py 中相同的构建方式。
+    使用 ChatQwen（OpenAI 兼容模式），支持 ainvoke 异步调用。
     """
     try:
-        from ragas.llms import LangchainLLMWrapper
-        from langchain_community.chat_models import ChatTongyi
+        from langchain_qwq import ChatQwen
         from app.config import config
 
-        llm_kwargs: dict[str, Any] = {
-            "model": config.eval_judge_model,
-            "temperature": config.eval_judge_temperature,
-            "dashscope_api_key": config.eval_judge_api_key or config.dashscope_api_key,
-        }
-        judge_api_base = config.eval_judge_api_base
-        if judge_api_base:
-            llm_kwargs["dashscope_api_base"] = judge_api_base
+        api_key = config.eval_judge_api_key or config.dashscope_api_key
+        api_base = config.eval_judge_api_base or config.dashscope_api_base
 
-        llm = ChatTongyi(**llm_kwargs)
-        ragas_llm = LangchainLLMWrapper(llm)
-        return ragas_llm
+        llm = ChatQwen(
+            model=config.eval_judge_model,
+            temperature=config.eval_judge_temperature,
+            api_key=api_key,
+            api_base=api_base,
+            timeout=config.llm_timeout,
+            max_retries=config.llm_max_retries,
+        )
+        return llm
 
     except ImportError as e:
-        logger.error(f"RAGAs 依赖未安装: {e}")
-        logger.error("请运行: pip install 'ragas>=0.2.0'")
+        logger.error(f"依赖未安装: {e}")
         sys.exit(1)
 
 
 async def _execute_single_case(
     case_index: int,
     case: dict[str, Any],
+    timeout_s: int = 60,
 ) -> dict[str, Any]:
     """执行单个 Agent 测试用例。
 
@@ -73,6 +72,7 @@ async def _execute_single_case(
     Args:
         case_index: 测试用例序号。
         case: 测试用例字典。
+        timeout_s: 单 case 超时（秒），默认 60s。
 
     Returns:
         dict: 包含执行结果（answer, actual_tools, 或 error）。
@@ -82,12 +82,18 @@ async def _execute_single_case(
     question: str = case.get("input", "")
     scenario: str = case.get("scenario", "unknown")
 
-    logger.info(f"[{case_index + 1}] 执行 Agent: scenario={scenario}, input='{question[:60]}'")
+    logger.info(
+        f"[{case_index + 1}] 执行 Agent: scenario={scenario}, "
+        f"input='{question[:60]}', timeout={timeout_s}s"
+    )
 
     try:
-        result = await rag_agent_service.query_with_trace(
-            question=question,
-            session_id=f"agent_eval_{case_index}",
+        result = await asyncio.wait_for(
+            rag_agent_service.query_with_trace(
+                question=question,
+                session_id=f"agent_eval_{case_index}",
+            ),
+            timeout=timeout_s,
         )
         actual_tools = result.get("tool_calls", [])
         answer = result.get("answer", "")
@@ -99,6 +105,13 @@ async def _execute_single_case(
             "answer": answer,
             "actual_tools": actual_tools,
             "error": None,
+        }
+    except asyncio.TimeoutError:
+        logger.warning(f"[{case_index + 1}] Agent 执行超时 ({timeout_s}s)")
+        return {
+            "answer": "",
+            "actual_tools": [],
+            "error": f"执行超时 ({timeout_s}s)",
         }
     except Exception as e:
         logger.error(f"[{case_index + 1}] Agent 执行失败: {e}")
@@ -141,14 +154,16 @@ async def _compute_goal_metrics(
     exec_result: dict[str, Any],
     judge_llm: Any,
     skip_goal: bool = False,
+    judge_timeout_s: int = 120,
 ) -> dict[str, Any]:
     """计算单个 case 的目标达成率。
 
     Args:
         case: 测试用例字典。
         exec_result: Agent 执行结果。
-        judge_llm: RAGAs LangchainLLMWrapper 实例。
+        judge_llm: LangChain LLM 实例。
         skip_goal: 是否跳过 Goal Accuracy 评估。
+        judge_timeout_s: Judge 评分总超时（秒），默认 120s（3 次 × ~30s + 余量）。
 
     Returns:
         dict: 包含 goal_score 或 None 的字典。
@@ -163,15 +178,24 @@ async def _compute_goal_metrics(
         return {"goal_score": 0.0}
 
     answer = exec_result.get("answer", "")
-    ga = await compute_goal_accuracy(
-        user_question=case.get("input", ""),
-        expected_conclusion_contains=case.get("expected_conclusion_contains", []),
-        agent_output=answer,
-        judge_llm=judge_llm,
-        num_trials=3,
-    )
-
-    return {"goal_score": ga["score"]}
+    try:
+        ga = await asyncio.wait_for(
+            compute_goal_accuracy(
+                user_question=case.get("input", ""),
+                expected_conclusion_contains=case.get("expected_conclusion_contains", []),
+                agent_output=answer,
+                judge_llm=judge_llm,
+                num_trials=3,
+            ),
+            timeout=judge_timeout_s,
+        )
+        return {"goal_score": ga["score"]}
+    except asyncio.TimeoutError:
+        logger.warning(f"Goal Accuracy Judge 超时 ({judge_timeout_s}s)")
+        return {"goal_score": 0.0}
+    except Exception as e:
+        logger.error(f"Goal Accuracy 计算失败: {e}")
+        return {"goal_score": 0.0}
 
 
 async def run_agent_evaluation(
@@ -240,7 +264,7 @@ async def run_agent_evaluation(
     # 2. 构建 LLM Judge
     judge_llm = None
     if not skip_goal:
-        judge_llm = _build_llm_wrapper()
+        judge_llm = _build_judge_llm()
 
     # 3. 逐条执行 Agent
     per_case: list[dict[str, Any]] = []

@@ -57,6 +57,22 @@ services:
     depends_on:
       - "etcd"
       - "minio"
+
+  # P1-2.3: Redis 容器 — Agent 会话持久化与 Trace 存储
+  redis:
+    container_name: oncallmind-redis
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - ${DOCKER_VOLUME_DIRECTORY:-.}/volumes/redis:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
   # 这是新增的 Attu 服务哦！
   attu:
     container_name: milvus-attu

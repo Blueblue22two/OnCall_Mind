@@ -3,18 +3,30 @@ Planner 节点：制定执行计划
 基于 LangGraph 官方教程实现
 """
 
+import time
 from textwrap import dedent
 from typing import Dict, Any, List
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_qwq import ChatQwen
 from pydantic import BaseModel, Field
 from loguru import logger
 
 from app.config import config
+from app.core.llm_factory import create_chat_qwen
 from app.tools import get_current_time, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.services.trace_store import get_trace_store, extract_token_usage
 from .state import PlanExecuteState
 from .utils import format_tools_description
+
+
+def _save_node_trace(trace_id: str, node_name: str, data: dict) -> None:
+    """保存单个节点的 trace 数据（P1-2.1）。"""
+    if not trace_id:
+        return
+    try:
+        get_trace_store().save_node_trace(trace_id, node_name, data)
+    except Exception as e:
+        logger.warning(f"保存节点 trace 失败 ({node_name}): {e}")
 
 
 class Plan(BaseModel):
@@ -71,7 +83,12 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
     logger.info("=== Planner：制定执行计划 ===")
 
     input_text = state.get("input", "")
+    trace_id = state.get("trace_id", "")
     logger.info(f"用户输入: {input_text}")
+
+    t_start = time.monotonic()
+    token_usage = {"input": 0, "output": 0, "total": 0}
+    experience_docs_used = False
 
     try:
         # 步骤1: 查询内部文档获取相关经验
@@ -83,6 +100,7 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
             context_str = await retrieve_knowledge.ainvoke({"query": input_text})
             if context_str and context_str.strip():
                 experience_docs = context_str
+                experience_docs_used = True
                 logger.info(f"找到相关经验文档，长度: {len(experience_docs)}")
             else:
                 logger.info("未找到相关经验文档")
@@ -90,21 +108,17 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
             logger.warning(f"查询内部文档失败: {e}")
 
         # 步骤2: 获取可用工具列表
-        # 获取本地工具
         local_tools = [
             get_current_time,
             retrieve_knowledge
         ]
 
-        # 获取 MCP 工具
         mcp_client = await get_mcp_client_with_retry()
         mcp_tools = await mcp_client.get_tools()
 
-        # 合并所有工具
         all_tools = local_tools + mcp_tools
         logger.info(f"可用工具数量: 本地 {len(local_tools)} + MCP {len(mcp_tools)}")
 
-        # 格式化工具描述
         tools_description = format_tools_description(all_tools)
 
         # 步骤3: 格式化经验文档上下文
@@ -121,38 +135,51 @@ async def planner(state: PlanExecuteState) -> Dict[str, Any]:
         else:
             experience_context = ""
 
-        # 步骤4: 创建 LLM 并生成计划
-        llm = ChatQwen(
-            model=config.rag_model,
-            api_key=config.dashscope_api_key,
-            temperature=0
-        )
+        # 步骤4: 创建 LLM 并生成计划（P0-1.1: 使用统一工厂）
+        llm = create_chat_qwen(temperature=0)
 
         planner_chain = planner_prompt | llm.with_structured_output(Plan)
 
-        # 调用 LLM 生成计划
         plan_result = await planner_chain.ainvoke({
             "messages": [("user", input_text)],
             "tools_description": tools_description,
             "experience_context": experience_context
         })
 
-        # 提取步骤列表
+        # P1-2.1: 提取 token 用量
+        token_usage = extract_token_usage(plan_result)
+
         if isinstance(plan_result, Plan):
             plan_steps = plan_result.steps
         else:
-            # 如果返回的是字典，提取 steps 字段
             plan_steps = plan_result.get("steps", [])  # type: ignore
 
         logger.info(f"计划已生成，共 {len(plan_steps)} 个步骤")
         for i, step in enumerate(plan_steps, 1):
             logger.info(f"  步骤{i}: {step}")
 
+        # P1-2.1: 保存节点 trace
+        _save_node_trace(trace_id, "planner", {
+            "plan": plan_steps,
+            "experience_docs_used": experience_docs_used,
+            "token_usage": token_usage,
+            "duration_ms": int((time.monotonic() - t_start) * 1000),
+            "status": "success",
+        })
+
         return {"plan": plan_steps}
 
     except Exception as e:
         logger.error(f"生成计划失败: {e}", exc_info=True)
-        # 返回一个默认计划
+        # P1-2.1: 记录失败 trace
+        _save_node_trace(trace_id, "planner", {
+            "plan": [],
+            "experience_docs_used": experience_docs_used,
+            "token_usage": token_usage,
+            "duration_ms": int((time.monotonic() - t_start) * 1000),
+            "status": "error",
+            "error": str(e),
+        })
         return {
             "plan": [
                 "收集相关信息",

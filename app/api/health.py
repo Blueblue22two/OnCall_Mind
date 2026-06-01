@@ -1,8 +1,11 @@
-"""健康检查接口"""
+"""健康检查与可观测性接口
+
+P1-2.4: 新增 /metrics 端点暴露 Prometheus 指标。
+"""
 
 from typing import Any
 from fastapi import APIRouter
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from app.config import config
 from app.core.milvus_client import milvus_manager
 from loguru import logger
@@ -61,4 +64,20 @@ async def health_check():
             "message": "服务运行正常" if overall_status == "healthy" else "服务不可用",
             "data": health_data
         }
+    )
+
+
+@router.get("/metrics")
+async def metrics():
+    """Prometheus 指标端点（P1-2.4）。
+
+    暴露 LLM 调用延迟/成功率/重试次数、Agent 执行次数/错误等指标。
+
+    Returns:
+        Response: Prometheus text format。
+    """
+    from app.core.metrics import get_metrics_response
+    return Response(
+        content=get_metrics_response(),
+        media_type="text/plain; charset=utf-8",
     )

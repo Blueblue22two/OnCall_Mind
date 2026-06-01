@@ -7,7 +7,10 @@
 确保上下文窗口不超过配置上限。
 """
 
-from typing import Annotated, Any, AsyncGenerator, Dict, Sequence
+import time
+from collections.abc import AsyncGenerator, Sequence
+from datetime import datetime
+from typing import Annotated, Any
 
 from langchain.agents import create_agent
 from langchain_core.messages import (
@@ -19,11 +22,12 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph.message import add_messages
 from loguru import logger
 from typing_extensions import TypedDict
-from langchain_qwq import ChatQwen
 
-from app.config import config
-from app.tools import get_current_time, retrieve_knowledge
 from app.agent.mcp_client import get_mcp_client_with_retry
+from app.config import config
+from app.core.llm_factory import create_chat_qwen_for_chat
+from app.services.trace_store import extract_token_usage, get_trace_store
+from app.tools import get_current_time, retrieve_knowledge
 
 # 阿里千问大模型和langchain集成参考： https://docs.langchain.com/oss/python/integrations/chat/qwen
 # 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
@@ -94,13 +98,8 @@ class RagAgentService:
         self.streaming = streaming
         self.system_prompt = self._build_system_prompt()
 
-
-        self.model = ChatQwen(
-            model=self.model_name,
-            api_key=config.dashscope_api_key,
-            temperature=0.7,
-            streaming=streaming,
-        )
+        # P0-1.1: 使用统一工厂创建对话 LLM（默认 temperature=0.7, streaming=True）
+        self.model = create_chat_qwen_for_chat(streaming=streaming)
 
         # 定义基础工具
         self.tools = [retrieve_knowledge, get_current_time]
@@ -110,9 +109,24 @@ class RagAgentService:
 
         # 创建检查点（Redis 或内存，用于会话管理）
         if config.redis_url:
-            from langgraph.checkpoint.redis import RedisSaver
-            self.checkpointer = RedisSaver.from_conn_string(config.redis_url)
-            logger.info(f"使用 RedisSaver: {config.redis_url}")
+            try:
+                from langgraph.checkpoint.base import BaseCheckpointSaver
+                from langgraph.checkpoint.redis import RedisSaver
+                maybe_saver = RedisSaver.from_conn_string(config.redis_url)
+                if isinstance(maybe_saver, BaseCheckpointSaver):
+                    self.checkpointer = maybe_saver
+                    logger.info(f"使用 RedisSaver: {config.redis_url}")
+                else:
+                    logger.warning(
+                        f"RedisSaver.from_conn_string 返回了 {type(maybe_saver)}，"
+                        f"可能需要 async context manager。回退到 MemorySaver。"
+                    )
+                    self.checkpointer = MemorySaver()
+                    logger.info("使用 MemorySaver（进程内存）")
+            except Exception as e:
+                logger.warning(f"RedisSaver 初始化失败 ({e})，回退到 MemorySaver")
+                self.checkpointer = MemorySaver()
+                logger.info("使用 MemorySaver（进程内存）")
         else:
             self.checkpointer = MemorySaver()
             logger.info("使用 MemorySaver（进程内存）")
@@ -270,6 +284,7 @@ class RagAgentService:
                 "tool_calls": [{"name": str, "args": dict}, ...],  # 工具调用列表
             }
         """
+        t_start = time.monotonic()
         try:
             await self._initialize_agent()
 
@@ -313,8 +328,14 @@ class RagAgentService:
             answer: str = ""
             for msg in reversed(messages_result):
                 content = msg.content if hasattr(msg, "content") else str(msg)
-                if content and content.strip():
-                    answer = content
+                # content 可能是 list（多模态消息），需转为 str
+                if isinstance(content, list):
+                    content = " ".join(
+                        item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                        for item in content
+                    )
+                if content and str(content).strip():
+                    answer = str(content)
                     break
 
             logger.info(
@@ -323,6 +344,33 @@ class RagAgentService:
                 f"tools={[tc['name'] for tc in tool_calls]}"
             )
 
+            # P1-2.1: 持久化 RAG Agent trace 到 TraceStore
+            duration_ms = int((time.monotonic() - t_start) * 1000)
+            token_usage = {"input": 0, "output": 0, "total": 0}
+            for msg in messages_result:
+                usage = extract_token_usage(msg)
+                if usage.get("total", 0) > 0:
+                    token_usage["input"] += usage.get("input", 0)
+                    token_usage["output"] += usage.get("output", 0)
+                    token_usage["total"] += usage.get("total", 0)
+
+            trace_id = f"rag_trace:{session_id}:{int(time.time() * 1000)}"
+            try:
+                get_trace_store().save_trace({
+                    "trace_id": trace_id,
+                    "session_id": session_id,
+                    "agent_type": "rag",
+                    "input": question,
+                    "tool_calls": tool_calls,
+                    "answer": answer[:2000],
+                    "token_usage": token_usage,
+                    "duration_ms": duration_ms,
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "success",
+                })
+            except Exception as e:
+                logger.warning(f"[会话 {session_id}] 保存 RAG trace 失败: {e}")
+
             return {
                 "answer": answer,
                 "tool_calls": tool_calls,
@@ -330,13 +378,32 @@ class RagAgentService:
 
         except Exception as e:
             logger.error(f"[会话 {session_id}] RAG Agent query_with_trace 失败: {e}")
+
+            # 保存失败 trace
+            try:
+                get_trace_store().save_trace({
+                    "trace_id": f"rag_trace:{session_id}:{int(time.time() * 1000)}",
+                    "session_id": session_id,
+                    "agent_type": "rag",
+                    "input": question,
+                    "tool_calls": [],
+                    "answer": "",
+                    "token_usage": {"input": 0, "output": 0, "total": 0},
+                    "duration_ms": int((time.monotonic() - t_start) * 1000),
+                    "timestamp": datetime.now().isoformat(),
+                    "status": "error",
+                    "error": str(e),
+                })
+            except Exception as trace_e:
+                logger.warning(f"[会话 {session_id}] 保存 RAG error trace 失败: {trace_e}")
+
             raise
 
     async def query_stream(
         self,
         question: str,
         session_id: str,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
+    ) -> AsyncGenerator[dict[str, Any], None]:
         """
         流式处理用户问题（逐步返回答案片段）
 
@@ -420,14 +487,14 @@ class RagAgentService:
         try:
             # 使用 checkpointer 的 get 方法获取最新的检查点
             config = {"configurable": {"thread_id": session_id}}
-            
+
             # 获取该 thread 的最新检查点
             checkpoint_tuple = self.checkpointer.get(config)
-            
+
             if not checkpoint_tuple:
                 logger.info(f"获取会话历史: {session_id}, 消息数量: 0")
                 return []
-            
+
             # checkpoint_tuple 可能是命名元组或普通元组，安全地提取 checkpoint
             # 通常第一个元素是 checkpoint 数据
             if hasattr(checkpoint_tuple, 'checkpoint'):
@@ -435,20 +502,20 @@ class RagAgentService:
             else:
                 # 如果是普通元组，第一个元素是 checkpoint
                 checkpoint_data = checkpoint_tuple[0] if checkpoint_tuple else {}
-            
+
             # 从检查点中提取消息
             messages = checkpoint_data.get("channel_values", {}).get("messages", [])
-            
+
             # 转换为前端需要的格式
             history = []
             for msg in messages:
                 # 跳过系统消息
                 if isinstance(msg, SystemMessage):
                     continue
-                    
+
                 role = "user" if isinstance(msg, HumanMessage) else "assistant"
                 content = msg.content if hasattr(msg, 'content') else str(msg)
-                
+
                 # 提取时间戳（如果有的话）
                 timestamp = getattr(msg, 'timestamp', None)
                 if timestamp:
@@ -464,10 +531,10 @@ class RagAgentService:
                         "content": content,
                         "timestamp": datetime.now().isoformat()
                     })
-            
+
             logger.info(f"获取会话历史: {session_id}, 消息数量: {len(history)}")
             return history
-            
+
         except Exception as e:
             logger.error(f"获取会话历史失败: {session_id}, 错误: {e}")
             return []
@@ -485,10 +552,10 @@ class RagAgentService:
         try:
             # 使用 checkpointer 的 delete_thread 方法删除该 thread 的所有检查点
             self.checkpointer.delete_thread(session_id)
-            
+
             logger.info(f"已清除会话历史: {session_id}")
             return True
-            
+
         except Exception as e:
             logger.error(f"清空会话历史失败: {session_id}, 错误: {e}")
             return False

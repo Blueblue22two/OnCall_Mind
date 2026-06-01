@@ -1,8 +1,12 @@
 """
 通用 Plan-Execute-Replan 服务
 基于 LangGraph 官方教程实现
+
+P1-2.1: 集成 TraceStore，生成 trace_id 并随状态传递，结束时保存完整 trace
+P1-2.2: 增加 error_handler 节点，统一错误处理与 fallback
 """
 
+import time
 from typing import AsyncGenerator, Dict, Any
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -16,74 +20,168 @@ from app.config import config
 NODE_PLANNER = "planner"
 NODE_EXECUTOR = "executor"
 NODE_REPLANNER = "replanner"
+NODE_ERROR_HANDLER = "error_handler"  # P1-2.2
+
+
+async def _error_handler(state: PlanExecuteState) -> Dict[str, Any]:
+    """P1-2.2: 统一错误处理节点。
+
+    当 executor 或 planner 抛出未捕获异常时进入此节点。
+    根据 error_count 决定是重试还是强制生成响应。
+    """
+    error_count = state.get("error_count", 0) + 1
+    last_error = state.get("last_error", "未知错误")
+    max_errors = state.get("max_errors", 3)
+
+    logger.warning(
+        f"Error Handler 触发: error_count={error_count}/{max_errors}, "
+        f"last_error={last_error}"
+    )
+
+    # 如果超过最大错误数，强制结束
+    if error_count >= max_errors:
+        logger.error(f"错误数达到上限 {max_errors}，强制终止")
+        from textwrap import dedent
+        return {
+            "response": dedent(f"""# 诊断过程异常终止
+
+## 错误摘要
+- 累计错误次数: {error_count}
+- 最近错误: {last_error}
+
+## 说明
+由于多次执行失败，诊断过程被强制终止。请检查：
+1. MCP 服务（CLS / Monitor）是否正常运行
+2. 网络连接是否正常
+3. API Key 是否有效
+"""),
+            "error_count": error_count,
+            "last_error": last_error,
+        }
+
+    # 未达上限，清除错误以便重试
+    logger.info(f"错误 {error_count}/{max_errors}，尝试继续执行")
+    return {
+        "error_count": error_count,
+        "last_error": last_error,
+    }
 
 
 class AIOpsService:
-    """通用 Plan-Execute-Replan 服务"""
+    """通用 Plan-Execute-Replan 服务（P1-2.1/2.2 增强）"""
 
     def __init__(self):
         """初始化服务"""
-        # 创建检查点（Redis 或内存，用于会话管理）
-        if config.redis_url:
-            from langgraph.checkpoint.redis import RedisSaver
-            self.checkpointer = RedisSaver.from_conn_string(config.redis_url)
-            logger.info(f"AIOps 使用 RedisSaver: {config.redis_url}")
-        else:
-            self.checkpointer = MemorySaver()
-            logger.info("AIOps 使用 MemorySaver（进程内存）")
+        # P1-2.3: Redis 优先，不可用时自动回退 MemorySaver
+        self.checkpointer = self._create_checkpointer()
         self.graph = self._build_graph()
-        logger.info("Plan-Execute-Replan Service 初始化完成")
+        logger.info("Plan-Execute-Replan Service 初始化完成 (P1 enhanced)")
+
+    @staticmethod
+    def _create_checkpointer():
+        """创建 checkpointer，Redis 优先，不可用时回退 MemorySaver。
+
+        P1-2.3: 兼容 LangGraph 新旧版本 RedisSaver API。
+        """
+        if config.redis_url:
+            try:
+                from langgraph.checkpoint.redis import RedisSaver
+                # 新版本 from_conn_string 可能返回 async context manager
+                maybe_saver = RedisSaver.from_conn_string(config.redis_url)
+                # 检查是否为有效的 checkpointer 实例
+                from langgraph.checkpoint.base import BaseCheckpointSaver
+                if isinstance(maybe_saver, BaseCheckpointSaver):
+                    logger.info(f"AIOps 使用 RedisSaver: {config.redis_url}")
+                    return maybe_saver
+                else:
+                    logger.warning(
+                        f"RedisSaver.from_conn_string 返回了 {type(maybe_saver)}，"
+                        f"可能需要 async context manager。回退到 MemorySaver。"
+                    )
+            except Exception as e:
+                logger.warning(f"RedisSaver 初始化失败 ({e})，回退到 MemorySaver")
+        logger.info("AIOps 使用 MemorySaver（进程内存）")
+        return MemorySaver()
 
     def _build_graph(self):
-        """构建 Plan-Execute-Replan 工作流"""
-        logger.info("构建工作流图...")
+        """构建 Plan-Execute-Replan 工作流（P1-2.2: 增加 error_handler）"""
+        logger.info("构建工作流图（含 error_handler）...")
 
-        # 创建状态图
         workflow = StateGraph(PlanExecuteState)
 
-        # 添加节点
-        workflow.add_node(NODE_PLANNER, planner)      # 制定计划
-        workflow.add_node(NODE_EXECUTOR, executor)  # 执行步骤
-        workflow.add_node(NODE_REPLANNER, replanner)  # 重新规划
+        workflow.add_node(NODE_PLANNER, planner)
+        workflow.add_node(NODE_EXECUTOR, executor)
+        workflow.add_node(NODE_REPLANNER, replanner)
+        workflow.add_node(NODE_ERROR_HANDLER, _error_handler)
 
-        # 设置入口点
         workflow.set_entry_point(NODE_PLANNER)
 
-        # 定义边
-        workflow.add_edge(NODE_PLANNER, NODE_EXECUTOR)     # planner -> executor
-        workflow.add_edge(NODE_EXECUTOR, NODE_REPLANNER)   # executor -> replanner
+        workflow.add_edge(NODE_PLANNER, NODE_EXECUTOR)
+        workflow.add_edge(NODE_EXECUTOR, NODE_REPLANNER)
 
-        # replanner 的条件边
-        def should_continue(state: PlanExecuteState) -> str:
-            """判断是否继续执行"""
-            # 如果已经生成了最终响应，结束
+        # P1-2.2: 条件边 — executor 出错时也走 error_handler
+        def after_replanner(state: PlanExecuteState) -> str:
+            """Replanner 之后的路由。
+
+            如果已生成响应 → END
+            如果 error_count 超过 max_errors → NODE_ERROR_HANDLER
+            如果还有计划 → NODE_EXECUTOR
+            否则 → END
+            """
             if state.get("response"):
                 logger.info("已生成最终响应，结束流程")
                 return END
 
-            # 如果还有计划步骤，继续执行
+            error_count = state.get("error_count", 0)
+            max_errors = state.get("max_errors", 3)
+            if error_count >= max_errors:
+                logger.info(f"错误数达标 ({error_count}/{max_errors})，进入 error_handler")
+                return NODE_ERROR_HANDLER
+
             plan = state.get("plan", [])
             if plan:
                 logger.info(f"继续执行，剩余 {len(plan)} 个步骤")
                 return NODE_EXECUTOR
 
-            # 计划为空但没有响应，返回 replanner 生成响应
-            logger.info("计划执行完毕，生成最终响应")
+            logger.info("计划执行完毕，结束流程")
             return END
 
         workflow.add_conditional_edges(
             NODE_REPLANNER,
-            should_continue,
+            after_replanner,
             {
                 NODE_EXECUTOR: NODE_EXECUTOR,
-                END: END
+                NODE_ERROR_HANDLER: NODE_ERROR_HANDLER,
+                END: END,
             }
         )
 
-        # 编译工作流
-        compiled_graph = workflow.compile(checkpointer=self.checkpointer)
+        # P1-2.2: error_handler 之后的路由
+        def after_error_handler(state: PlanExecuteState) -> str:
+            """错误处理后的路由。
 
-        logger.info("工作流图构建完成")
+            如果已生成响应 → END
+            否则尝试继续执行剩余计划。
+            """
+            if state.get("response"):
+                return END
+
+            plan = state.get("plan", [])
+            if plan:
+                return NODE_EXECUTOR
+            return END
+
+        workflow.add_conditional_edges(
+            NODE_ERROR_HANDLER,
+            after_error_handler,
+            {
+                NODE_EXECUTOR: NODE_EXECUTOR,
+                END: END,
+            }
+        )
+
+        compiled_graph = workflow.compile(checkpointer=self.checkpointer)
+        logger.info("工作流图构建完成（含 P1-2.2 error_handler）")
         return compiled_graph
 
     async def execute(
@@ -103,16 +201,24 @@ class AIOpsService:
         """
         logger.info(f"[会话 {session_id}] 开始执行任务: {user_input}")
 
+        # P1-2.1: 生成 trace_id
+        trace_id = f"trace:{session_id}:{int(time.time() * 1000)}"
+        t_total_start = time.monotonic()
+
         try:
-            # 初始化状态
+            # P1-2.1: 初始状态包含 trace_id
+            # P1-2.2: 初始状态包含 max_errors
             initial_state: PlanExecuteState = {
                 "input": user_input,
                 "plan": [],
                 "past_steps": [],
-                "response": ""
+                "response": "",
+                "trace_id": trace_id,
+                "error_count": 0,
+                "max_errors": 3,
+                "last_error": "",
             }
 
-            # 流式执行工作流
             config_dict = {
                 "configurable": {
                     "thread_id": session_id
@@ -124,11 +230,9 @@ class AIOpsService:
                 config=config_dict,
                 stream_mode="updates"
             ):
-                # 解析事件
                 for node_name, node_output in event.items():
                     logger.info(f"节点 '{node_name}' 输出事件")
 
-                    # 根据节点类型生成不同的事件
                     if node_name == NODE_PLANNER:
                         yield self._format_planner_event(node_output)
 
@@ -138,20 +242,48 @@ class AIOpsService:
                     elif node_name == NODE_REPLANNER:
                         yield self._format_replanner_event(node_output)
 
+                    elif node_name == NODE_ERROR_HANDLER:
+                        yield {
+                            "type": "status",
+                            "stage": "error_handler",
+                            "message": f"错误处理: {node_output.get('last_error', '')}",
+                            "error_count": node_output.get("error_count", 0),
+                        }
+
             # 获取最终状态
             final_state = self.graph.get_state(config_dict)
             final_response = ""
 
-            # 安全地获取响应（处理 values 可能为 None 的情况）
             if final_state and final_state.values:
                 final_response = final_state.values.get("response", "")
+
+            # P1-2.1: 保存完整 trace
+            total_duration = int((time.monotonic() - t_total_start) * 1000)
+            try:
+                from app.services.trace_store import get_trace_store
+                trace_store = get_trace_store()
+                trace_store.save_trace({
+                    "trace_id": trace_id,
+                    "session_id": session_id,
+                    "input": user_input,
+                    "plan": final_state.values.get("plan", []) if final_state and final_state.values else [],
+                    "past_steps_count": len(final_state.values.get("past_steps", [])) if final_state and final_state.values else 0,
+                    "error_count": final_state.values.get("error_count", 0) if final_state and final_state.values else 0,
+                    "final_response": final_response[:5000] if final_response else "",
+                    "total_duration_ms": total_duration,
+                    "status": "completed" if final_response else "error",
+                })
+                logger.info(f"[会话 {session_id}] Trace 已保存: {trace_id}")
+            except Exception as e:
+                logger.error(f"[会话 {session_id}] 保存 Trace 失败: {e}")
 
             # 发送完成事件
             yield {
                 "type": "complete",
                 "stage": "complete",
                 "message": "任务执行完成",
-                "response": final_response
+                "response": final_response,
+                "trace_id": trace_id,
             }
 
             # 持久化诊断记录
@@ -169,14 +301,15 @@ class AIOpsService:
             except Exception as e:
                 logger.error(f"[会话 {session_id}] 保存诊断记录失败: {e}")
 
-            logger.info(f"[会话 {session_id}] 任务执行完成")
+            logger.info(f"[会话 {session_id}] 任务执行完成, trace_id={trace_id}")
 
         except Exception as e:
             logger.error(f"[会话 {session_id}] 任务执行失败: {e}", exc_info=True)
             yield {
                 "type": "error",
                 "stage": "error",
-                "message": f"任务执行出错: {str(e)}"
+                "message": f"任务执行出错: {str(e)}",
+                "trace_id": trace_id,
             }
 
     async def diagnose(
@@ -192,7 +325,6 @@ class AIOpsService:
         Yields:
             Dict[str, Any]: 诊断过程的流式事件
         """
-        # 使用固定的 AIOps 任务描述
         from textwrap import dedent
         aiops_task = dedent("""诊断当前系统是否存在告警，如果存在告警请详细分析告警原因并生成诊断报告，诊断报告输出格式要求：
                 ```
@@ -269,16 +401,15 @@ class AIOpsService:
                 - 如果某个步骤失败，在结论中如实说明，不要跳过""")
 
         async for event in self.execute(aiops_task, session_id):
-            # 转换事件格式以兼容旧的 API
             if event.get("type") == "complete":
-                # 将 response 包装为 diagnosis 格式
                 yield {
                     "type": "complete",
                     "stage": "diagnosis_complete",
                     "message": "诊断流程完成",
                     "diagnosis": {
                         "status": "completed",
-                        "report": event.get("response", "")
+                        "report": event.get("response", ""),
+                        "trace_id": event.get("trace_id", ""),
                     }
                 }
             else:
@@ -343,7 +474,6 @@ class AIOpsService:
         plan = state.get("plan", [])
 
         if response:
-            # 已生成最终响应
             return {
                 "type": "report",
                 "stage": "final_report",
@@ -351,7 +481,6 @@ class AIOpsService:
                 "report": response
             }
         else:
-            # 重新规划
             return {
                 "type": "status",
                 "stage": "replanner",
