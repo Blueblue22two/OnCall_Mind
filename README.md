@@ -4,8 +4,6 @@
 
 OnCall Mind 是一个基于 FastAPI、LangChain、LangGraph 和 Milvus 的智能运维原型系统。项目当前重点用于帮助运维人员围绕常见故障进行知识检索、告警排查、日志与监控数据分析，并生成结构化诊断报告。
 
-当前系统已经具备可用的诊断辅助能力，但仍属于“智能运维辅助系统”阶段，并非完整的自动化处置闭环平台。自动执行、审批流、回滚、工单系统和复盘沉淀等能力仍适合作为后续演进方向。
-
 ## 当前用途
 
 - **RAG 知识库问答**：上传运维 SOP 文档后，可基于知识库回答 CPU、内存、磁盘、网络、服务不可用等常见故障问题。
@@ -141,7 +139,7 @@ EVAL_JUDGE_API_BASE=
 EVAL_JUDGE_API_KEY=
 ```
 
-> **注意** !!! 如果各位用户部署该项目时，不要把真实 API Key 提交到代码仓库1避免API KEY泄露。 
+> **注意** !!! 如果各位用户部署该项目时，不要把真实 API Key 提交到代码仓库避免API KEY泄露。 
 
 ## 部署与启动
 
@@ -278,14 +276,9 @@ python -m tests.evaluation.evaluate_rag
 # RAG 检索 + 生成评估
 python -m tests.evaluation.evaluate_rag --with-generation
 
-# RAG 消融实验
-python -m tests.evaluation.run_ablation
-
 # Agent 工具调用评估
 python -m tests.evaluation.evaluate_agent --skip-goal
 
-# AIOps 诊断流程评估
-python -m tests.evaluation.evaluate_aiops_agent
 ```
 
 ## 常用开发命令
