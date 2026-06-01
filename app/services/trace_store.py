@@ -33,22 +33,56 @@ class TraceStore:
 
     def __init__(self):
         self._redis_client: Any = None
+        self._file_dir = Path("agent_traces")
+        self._file_dir.mkdir(exist_ok=True)
         if config.redis_url:
             try:
                 import redis as redis_lib
 
                 self._redis_client = redis_lib.from_url(config.redis_url)
+                # 快速验证连接可用
+                self._redis_client.ping()
                 logger.info(f"TraceStore 使用 Redis: {config.redis_url}")
             except Exception as e:
-                logger.warning(f"TraceStore Redis 连接失败，回退到文件存储: {e}")
+                logger.warning(f"TraceStore Redis 连接失败 ({e})，回退到文件存储")
+                self._redis_client = None
 
         if not self._redis_client:
-            self._file_dir = Path("agent_traces")
-            self._file_dir.mkdir(exist_ok=True)
             logger.info(f"TraceStore 使用文件存储: {self._file_dir}")
+
+    def _file_save(self, key: str, data: str, prefix: str = "trace_") -> None:
+        """文件存储回退方法。"""
+        file_path = self._file_dir / f"{prefix}{key.replace(':', '_')}.json"
+        file_path.write_text(data)
+
+    def _save_to_storage(self, key: str, data: str, ttl_days: int = 14, file_prefix: str = "trace_") -> str:
+        """统一的存储写入，Redis 优先，连接失败时自动回退文件。
+
+        Args:
+            key: 存储 key（不含前缀）。
+            data: JSON 字符串。
+            ttl_days: Redis TTL 天数。
+            file_prefix: 文件前缀（trace_ 用于完整 trace，partial_ 用于节点 trace）。
+
+        Returns:
+            str: 写入成功的存储后端标识 "redis" / "file"。
+        """
+        redis_key = f"trace:{key}"
+        if self._redis_client:
+            try:
+                self._redis_client.setex(redis_key, 86400 * ttl_days, data)
+                return "redis"
+            except Exception as e:
+                logger.warning(f"Redis 写入失败 ({e})，回退到文件存储")
+                self._redis_client = None
+        # 文件回退
+        self._file_save(key, data, prefix=file_prefix)
+        return "file"
 
     def save_trace(self, trace: dict[str, Any]) -> str:
         """保存完整的 Agent Trace。
+
+        Redis 优先，连接失败时自动回退本地文件。
 
         Args:
             trace: Trace 字典，必须包含 trace_id, session_id。
@@ -57,25 +91,12 @@ class TraceStore:
             str: trace_id。
         """
         trace_id = trace.get("trace_id", f"trace:{int(time.time() * 1000)}")
-        # 补充元数据
         trace.setdefault("saved_at", datetime.now().isoformat())
         trace.setdefault("app_version", config.app_version)
 
         data = json.dumps(trace, ensure_ascii=False, default=str)
-
-        if self._redis_client:
-            self._redis_client.setex(
-                f"trace:{trace_id}",
-                86400 * 14,  # 14天过期
-                data,
-            )
-        else:
-            file_path = self._file_dir / f"trace_{trace_id}.json"
-            file_path.write_text(
-                json.dumps(trace, ensure_ascii=False, indent=2, default=str)
-            )
-
-        logger.debug(f"Trace 已保存: {trace_id}")
+        backend = self._save_to_storage(trace_id, data, ttl_days=14)
+        logger.debug(f"Trace 已保存 ({backend}): {trace_id}")
         return trace_id
 
     def save_node_trace(self, trace_id: str, node_name: str, node_data: dict[str, Any]) -> None:
@@ -88,17 +109,10 @@ class TraceStore:
             node_name: 节点名（planner/executor/replanner）。
             node_data: 节点执行数据。
         """
-        key = f"trace_partial:{trace_id}:{node_name}"
+        key = f"node:{trace_id}:{node_name}"
         node_data["saved_at"] = datetime.now().isoformat()
         data = json.dumps(node_data, ensure_ascii=False, default=str)
-
-        if self._redis_client:
-            self._redis_client.setex(key, 86400, data)
-        else:
-            file_path = self._file_dir / f"trace_partial_{trace_id}_{node_name}.json"
-            file_path.write_text(
-                json.dumps(node_data, ensure_ascii=False, indent=2, default=str)
-            )
+        self._save_to_storage(key, data, ttl_days=1, file_prefix="partial_")
 
     def get_trace(self, trace_id: str) -> dict[str, Any] | None:
         """获取完整 Trace。
@@ -109,14 +123,19 @@ class TraceStore:
         Returns:
             dict | None: Trace 数据，不存在则返回 None。
         """
+        file_path = self._file_dir / f"trace_{trace_id.replace(':', '_')}.json"
+
         if self._redis_client:
-            data = self._redis_client.get(f"trace:{trace_id}")
-            return json.loads(data) if data else None
-        else:
-            file_path = self._file_dir / f"trace_{trace_id}.json"
-            if file_path.exists():
-                return json.loads(file_path.read_text())
-            return None
+            try:
+                data = self._redis_client.get(f"trace:{trace_id}")
+                if data:
+                    return json.loads(data)
+            except Exception as e:
+                logger.warning(f"Redis 读取失败 ({e})，尝试文件读取")
+
+        if file_path.exists():
+            return json.loads(file_path.read_text())
+        return None
 
     def list_by_session(self, session_id: str, limit: int = 20) -> list[dict[str, Any]]:
         """列出某个会话的所有 Trace（按时间倒序）。
@@ -130,24 +149,33 @@ class TraceStore:
         """
         records: list[dict[str, Any]] = []
 
-        if self._redis_client:
-            pattern = f"trace:*"
-            keys = list(self._redis_client.scan_iter(match=pattern, count=100))
-            for key in keys:
-                data = self._redis_client.get(key)
-                if data:
-                    record = json.loads(data)
-                    if record.get("session_id") == session_id:
-                        records.append(record)
-        else:
-            for f in sorted(self._file_dir.glob("trace_*.json"), reverse=True):
+        # 从文件读取（始终可用）
+        for f in sorted(self._file_dir.glob("trace_*.json"), reverse=True):
+            try:
                 record = json.loads(f.read_text())
                 if record.get("session_id") == session_id:
                     records.append(record)
                     if len(records) >= limit:
                         break
+            except Exception:
+                continue
 
-        records.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+        # 也从 Redis 读取（合并去重）
+        if self._redis_client:
+            try:
+                pattern = "trace:*"
+                keys = list(self._redis_client.scan_iter(match=pattern, count=100))
+                seen = {r.get("trace_id") for r in records}
+                for key in keys:
+                    data = self._redis_client.get(key)
+                    if data:
+                        record = json.loads(data)
+                        if record.get("session_id") == session_id and record.get("trace_id") not in seen:
+                            records.append(record)
+            except Exception as e:
+                logger.warning(f"Redis 列出失败 ({e})，仅返回文件结果")
+
+        records.sort(key=lambda r: r.get("timestamp", r.get("saved_at", "")), reverse=True)
         return records[:limit]
 
 

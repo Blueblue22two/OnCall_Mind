@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     )
 
     # 应用配置
-    app_name: str = "SuperBizAgent"
+    app_name: str = "OnCall Mind"
     app_version: str = "1.0.0"
     debug: bool = False
     host: str = "0.0.0.0"
@@ -72,8 +72,8 @@ class Settings(BaseSettings):
     # ------------------------------------------------------------------
     eval_judge_model: str = "qwen3.5-plus"
     eval_judge_temperature: float = 0.0
-    eval_judge_api_base: str = "https://api.vveai.com/v1"   # 空则复用 DASHSCOPE_API_BASE
-    eval_judge_api_key: str = "sk-7YJ2MiMARBNfW9Qn43D83c378f504e4cA7B6CdC68027F491"    # 空则复用 DASHSCOPE_API_KEY
+    eval_judge_api_base: str = "input your api base"   # 空则复用 DASHSCOPE_API_BASE
+    eval_judge_api_key: str = "Input your api key"    # 空则复用 DASHSCOPE_API_KEY
 
     # 文档分块配置
     chunk_max_size: int = 800

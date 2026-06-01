@@ -60,7 +60,7 @@ services:
 
   # P1-2.3: Redis 容器 — Agent 会话持久化与 Trace 存储
   redis:
-    container_name: biz-redis
+    container_name: oncallmind-redis
     image: redis:7-alpine
     ports:
       - "6379:6379"

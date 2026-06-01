@@ -1,597 +1,499 @@
-# SuperBizAgent 架构文档
+# OnCall Mind Architecture
+
+> 文档日期：2026-06-01  
+> 项目名称：OnCall Mind  
+> 项目定位：面向智能运维场景的 On-Call 诊断助手  
 
 ## 1. 系统概述
 
-### 1.1 项目背景
+OnCall Mind 是一个基于 FastAPI、LangChain、LangGraph、Milvus 和 MCP 的智能运维辅助系统。系统当前主要用于 RAG 知识库问答、日志/监控工具调用、AIOps 故障诊断、诊断报告生成和基础评估实验。
 
-SuperBizAgent 是一个基于 LangChain + LangGraph 的智能运维（AIOps）系统，旨在通过 RAG（检索增强生成）和 Agent 技术实现自动化的故障诊断和运维辅助决策。
+当前系统定位是“智能运维辅助系统”，重点帮助运维人员完成信息检索、告警排查、根因分析和处理建议生成。系统暂不默认执行真实生产变更操作，自动化处置、审批、回滚、工单集成和复盘沉淀属于后续演进方向。
 
-### 1.2 技术栈
+## 2. 核心能力
 
-| 层级 | 技术选型 |
-|------|----------|
-| **LLM** | 阿里千问（ChatQwen via DashScope API） |
-| **向量数据库** | Milvus（支持 Dense Vector + Sparse BM25） |
-| **Agent 框架** | LangGraph（Plan-Execute-Replan 模式） |
-| **工具协议** | MCP（Model Context Protocol） |
-| **Web 框架** | FastAPI + SSE 流式响应 |
-| **嵌入模型** | DashScope text-embedding-v4（1024 维） |
-| **精排模型** | BAAI/bge-reranker-v2-m3 |
+| 能力 | 当前实现 |
+|---|---|
+| RAG 知识问答 | 支持 Basic / Enhanced 两种检索模式 |
+| AIOps 诊断 | 基于 Plan-Execute-Replan 的诊断工作流 |
+| 工具调用 | 通过 MCP 接入日志查询和监控指标查询 |
+| Web 交互 | FastAPI + 静态前端 + SSE 流式输出 |
+| 文档索引 | 支持 Markdown / TXT / PDF 上传、分块、向量化 |
+| 会话管理 | 支持 MemorySaver / RedisSaver |
+| 诊断持久化 | 支持诊断报告和 trace 存储 |
+| 评估体系 | 支持 RAG Eval、Agent Eval、AIOps Eval |
+| 可观测性 | 支持日志、TraceStore、Prometheus Metrics |
 
-### 1.3 核心能力
+## 3. 总体架构
 
-- **智能对话**：基于 RAG 的知识问答，支持多轮对话
-- **故障诊断**：自动获取告警、分析根因、生成诊断报告
-- **知识管理**：文档上传、分块、向量化、检索
-- **混合检索**：Dense ANN + Sparse BM25 + RRF 融合
-- **精排优化**：Cross-Encoder 重排序提升检索质量
-- **流式输出**：SSE 实时推送诊断过程和结果
-
----
-
-## 2. 架构设计
-
-### 2.1 分层架构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        Presentation Layer                        │
-│         Static Web UI (HTML/CSS/JS) + FastAPI Routes            │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-┌─────────────────────────────────────────────────────────────────┐
-│                          API Layer                               │
-│  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐           │
-│  │ /chat    │ │ /file    │ │ /aiops   │ │ /health  │           │
-│  └──────────┘ └──────────┘ └──────────┘ └──────────┘           │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-┌─────────────────────────────────────────────────────────────────┐
-│                        Service Layer                             │
-│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐   │
-│  │ RagAgentService │ │ AIOpsService    │ │ VectorServices  │   │
-│  │ (对话代理)       │ │ (诊断服务)       │ │ (向量存储服务)   │   │
-│  └─────────────────┘ └─────────────────┘ └─────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-┌─────────────────────────────────────────────────────────────────┐
-│                        Agent Layer                               │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │              Plan-Execute-Replan Workflow                 │   │
-│  │  ┌────────┐    ┌──────────┐    ┌───────────┐            │   │
-│  │  │Planner │ -> │ Executor │ -> │ Replanner │ <-> 循环    │   │
-│  │  └────────┘    └──────────┘    └───────────┘            │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-┌─────────────────────────────────────────────────────────────────┐
-│                       Retriever Layer                            │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │                    Enhanced RAG Pipeline                  │   │
-│  │  Query Preprocessing -> Hybrid Search -> Reranking       │   │
-│  │  (rewrite/none)      (Dense+BM25+RRF)  (Cross-Encoder)   │   │
-│  └──────────────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-┌─────────────────────────────────────────────────────────────────┐
-│                     Infrastructure Layer                         │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
-│  │ Milvus      │ │ MCP Client  │ │ LLM Factory │               │
-│  │ (向量存储)   │ │ (工具协议)   │ │ (模型调用)   │               │
-│  └─────────────┘ └─────────────┘ └─────────────┘               │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-┌─────────────────────────────────────────────────────────────────┐
-│                      External Services                           │
-│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐               │
-│  │ DashScope   │ │ MCP Servers │ │ Milvus      │               │
-│  │ (LLM/Embed) │ │ (CLS/Monitor)│ │ (Database)  │               │
-│  └─────────────┘ └─────────────┘ └─────────────┘               │
-└─────────────────────────────────────────────────────────────────┘
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                        Web / API Layer                       │
+│  Static UI + FastAPI Routes                                  │
+│  /api/chat /api/chat_stream /api/aiops /api/upload /metrics  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                       Service Layer                          │
+│  RagAgentService  AIOpsService  VectorIndexService           │
+│  DiagnosisStore   TraceStore    VectorStoreManager           │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                         Agent Layer                          │
+│  RAG Agent: ReAct-style tool calling                         │
+│  AIOps Agent: Planner -> Executor -> Replanner               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                       Retriever Layer                        │
+│  Basic Retriever: Dense Vector Search                        │
+│  Enhanced Retriever: Query Rewrite + Hybrid Search + Rerank  │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                         Tool Layer                           │
+│  Local Tools: retrieve_knowledge, get_current_time            │
+│  MCP Tools: CLS log tools, Monitor metric tools               │
+└─────────────────────────────────────────────────────────────┘
+                              │
+┌─────────────────────────────────────────────────────────────┐
+│                    Infrastructure Layer                      │
+│  DashScope LLM / Embedding  Milvus  Redis  MCP Servers        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 2.2 目录结构
+## 4. 代码结构
 
-```
+```text
 app/
-├── main.py                 # FastAPI 应用入口
-├── config.py               # 配置管理（Pydantic Settings）
-├── api/                    # API 路由层
-│   ├── chat.py             # 对话接口
-│   ├── file.py             # 文件上传接口
-│   ├── aiops.py            # AIOps 诊断接口
-│   └── health.py           # 健康检查接口
-├── services/               # 业务服务层
-│   ├── rag_agent_service.py      # RAG Agent 服务
-│   ├── aiops_service.py          # AIOps 诊断服务
-│   ├── vector_store_manager.py   # 基础向量存储管理
-│   ├── enhanced_vector_store_manager.py  # 增强向量存储管理
-│   ├── vector_embedding_service.py       # 嵌入服务
-│   ├── vector_index_service.py           # 索引服务
-│   ├── vector_search_service.py          # 搜索服务
-│   └── document_splitter_service.py      # 文档分块服务
-├── agent/                  # Agent 模块
-│   ├── mcp_client.py       # MCP 客户端管理
-│   └── aiops/              # AIOps Agent
-│       ├── state.py        # 状态定义
-│       ├── planner.py      # 规划节点
-│       ├── executor.py     # 执行节点
-│       ├── replanner.py    # 重规划节点
-│       └── utils.py        # 工具函数
-├── retriever/              # 检索模块
-│   ├── base.py             # 基类
-│   ├── basic.py            # 基础检索器
-│   ├── enhanced.py         # 增强检索器
-│   ├── factory.py          # 工厂方法
+├── api/                    # FastAPI 路由
+├── agent/                  # Agent 工作流与 MCP 客户端
+│   └── aiops/              # Planner / Executor / Replanner
+├── core/                   # LLM 工厂、Milvus 客户端、Metrics
+├── models/                 # Pydantic 请求和响应模型
+├── retriever/              # Basic / Enhanced RAG 检索器
 │   ├── preprocessing/      # 查询预处理
-│   │   ├── rewrite.py      # LLM 改写
-│   │   └── passthrough.py  # 直通
 │   └── reranker/           # 精排器
-│       ├── cross_encoder.py  # Cross-Encoder 精排
-│       └── passthrough.py    # 直通
-├── tools/                  # 工具模块
-│   ├── knowledge_tool.py   # 知识检索工具
-│   └── time_tool.py        # 时间工具
-├── core/                   # 核心组件
-│   ├── milvus_client.py    # Milvus 客户端
-│   └── llm_factory.py      # LLM 工厂
-├── models/                 # 数据模型
-│   ├── request.py          # 请求模型
-│   ├── response.py         # 响应模型
-│   ├── document.py         # 文档模型
-│   └── aiops.py            # AIOps 模型
-└── utils/                  # 工具函数
-    └── logger.py           # 日志配置
+├── services/               # RAG、AIOps、索引、存储、Trace 服务
+├── tools/                  # 本地工具
+└── utils/                  # 日志等通用能力
+
+mcp_servers/
+├── cls_server.py           # 日志查询 MCP 服务
+└── monitor_server.py       # 监控指标 MCP 服务
+
+tests/evaluation/
+├── evaluate_rag.py         # RAG 评估
+├── evaluate_agent.py       # Agent 工具调用评估
+├── evaluate_aiops_agent.py # AIOps 诊断流程评估
+└── metrics/                # 自定义评估指标
 ```
 
----
+## 5. API 层设计
 
-## 3. 核心组件详解
+API 层基于 FastAPI 实现，主要负责请求接入、参数校验、流式响应和服务调用。
 
-### 3.1 Agent 系统
+| 路由 | 职责 |
+|---|---|
+| `app/api/chat.py` | 普通对话、流式对话、会话管理 |
+| `app/api/aiops.py` | AIOps 诊断和诊断历史查询 |
+| `app/api/file.py` | 文件上传和目录索引 |
+| `app/api/health.py` | 健康检查和 Prometheus 指标 |
 
-#### 3.1.1 RAG Agent（对话代理）
+核心 API：
 
-**文件**: `app/services/rag_agent_service.py`
+| 功能 | 方法 | 路径 |
+|---|---|---|
+| 普通对话 | POST | `/api/chat` |
+| 流式对话 | POST | `/api/chat_stream` |
+| AIOps 诊断 | POST | `/api/aiops` |
+| 文件上传 | POST | `/api/upload` |
+| 目录索引 | POST | `/api/index_directory` |
+| 健康检查 | GET | `/api/health` |
+| Metrics | GET | `/metrics` |
 
-**职责**: 处理用户对话请求，结合知识检索生成回答
+## 6. Service 层设计
 
-**核心流程**:
+Service 层承载系统主要业务逻辑。
+
+| 服务 | 职责 |
+|---|---|
+| `RagAgentService` | 构建 RAG Agent，处理对话和工具调用 |
+| `AIOpsService` | 构建 Plan-Execute-Replan 诊断工作流 |
+| `VectorIndexService` | 读取文件、分块、写入向量库 |
+| `DocumentSplitterService` | Markdown / 文本分块 |
+| `VectorStoreManager` | Basic 向量集合管理 |
+| `EnhancedVectorStoreManager` | Enhanced 混合检索集合管理 |
+| `TraceStore` | 保存 Agent 和 RAG 运行轨迹 |
+| `DiagnosisStore` | 保存诊断报告 |
+
+Service 层向上为 API 提供业务接口，向下调用 Agent、Retriever、Tool、Milvus、Redis 等组件。
+
+## 7. RAG 架构
+
+### 7.1 Basic RAG
+
+Basic 模式是单阶段 Dense 向量检索：
+
+```text
+Query
+  -> Embedding
+  -> Milvus Dense Vector Search
+  -> Top-K Documents
+  -> LLM Answer
 ```
-用户问题 -> System Prompt + Tools -> LLM 推理 -> 工具调用 -> 生成回答
+
+特点：
+
+- 实现简单。
+- 延迟较低。
+- 适合语义明确、知识库规模较小的场景。
+
+### 7.2 Enhanced RAG
+
+Enhanced 模式是三阶段检索流水线：
+
+```text
+Query
+  -> Query Preprocessing
+  -> Dense + Sparse Hybrid Search
+  -> RRF Fusion
+  -> Cross-Encoder Reranking
+  -> Top-K Documents
+  -> LLM Answer
 ```
 
-**关键特性**:
-- 使用 `ChatQwen` 原生集成，支持流式输出
-- 工具包括：`retrieve_knowledge`（知识检索）、`get_current_time`（时间）
-- MCP 工具动态加载（CLS 日志查询、监控指标查询）
-- 会话管理：`MemorySaver` 持久化对话历史
-- 消息修剪：保留首条系统消息 + 最近 6 条消息
+阶段说明：
 
-#### 3.1.2 AIOps Agent（诊断代理）
+| 阶段 | 说明 |
+|---|---|
+| Query Preprocessing | 可选 LLM 查询改写，提升召回 |
+| Hybrid Search | Dense 语义向量 + BM25 稀疏关键词检索 |
+| RRF Fusion | 融合 Dense 与 Sparse 排名 |
+| Reranking | 使用 Cross-Encoder 对候选文档精排 |
 
-**文件**: `app/services/aiops_service.py`, `app/agent/aiops/`
+降级策略：
 
-**职责**: 自动化故障诊断，生成诊断报告
+- 查询改写失败：回退到原始 query。
+- 精排失败：回退到粗排 Top-K。
+- 混合检索失败：抛出异常，不静默降级。
 
-**核心流程**: Plan-Execute-Replan 模式
+### 7.3 文档索引流程
 
-```
-┌─────────┐     ┌──────────┐     ┌───────────┐
-│ Planner │ --> │ Executor │ --> │ Replanner │
-└─────────┘     └──────────┘     └───────────┘
-     │               │                  │
-     │ 制定计划       │ 执行步骤          │ 评估结果
-     │               │                  │
-     │               └──────────────────┘
-     │                      是否完成？
-     │                     /        \
-     │                   否          是
-     │                    \          /
-     │                     \        /
-     │                    继续执行  END
-     └──────────────────────────────
+```text
+Upload File / Index Directory
+  -> Read Content
+  -> Split Document
+  -> Generate Embeddings
+  -> Write Basic Collection
+  -> Write Enhanced Collection
 ```
 
-**节点职责**:
+系统会将文档同时写入 Basic 和 Enhanced 两套集合，便于通过配置切换检索模式。
 
-| 节点 | 职责 | 输入 | 输出 |
-|------|------|------|------|
-| **Planner** | 制定执行计划 | 用户任务 | 步骤列表 |
-| **Executor** | 执行单个步骤 | 当前步骤 | 执行结果 |
-| **Replanner** | 评估结果，决定下一步 | 执行结果 | 新计划/最终响应 |
+## 8. Agent 架构
 
-**状态定义** (`PlanExecuteState`):
+### 8.1 RAG Agent
+
+RAG Agent 使用 LangChain / LangGraph Agent 能力，绑定本地工具和 MCP 工具。
+
+可用工具：
+
+- `retrieve_knowledge`：从 RAG 知识库检索相关内容。
+- `get_current_time`：获取当前时间。
+- MCP 日志工具：查询日志主题、搜索日志等。
+- MCP 监控工具：查询 CPU、内存等指标。
+
+处理流程：
+
+```text
+User Question
+  -> System Prompt
+  -> LLM Tool Decision
+  -> Tool Calls
+  -> Tool Results
+  -> Final Answer
+```
+
+### 8.2 AIOps Agent
+
+AIOps Agent 使用 Plan-Execute-Replan 工作流。
+
+```text
+Input
+  -> Planner
+  -> Executor
+  -> Replanner
+  -> Executor / Final Response
+```
+
+节点职责：
+
+| 节点 | 职责 |
+|---|---|
+| Planner | 结合用户任务、知识库和可用工具制定诊断计划 |
+| Executor | 执行当前步骤，调用知识库、日志、监控等工具 |
+| Replanner | 判断是否继续执行、重新规划或生成最终报告 |
+| Error Handler | 处理错误次数超限、工具失败等异常路径 |
+
+核心状态：
+
 ```python
 {
-    "input": str,           # 用户输入
-    "plan": List[str],      # 待执行步骤
-    "past_steps": List,     # 已执行步骤及结果
-    "response": str         # 最终响应
+    "input": str,
+    "plan": list[str],
+    "past_steps": list[tuple[str, str]],
+    "response": str,
+    "trace_id": str,
+    "error_count": int,
+    "max_errors": int,
+    "last_error": str,
 }
 ```
 
-### 3.2 Retriever 系统
+当前 AIOps Agent 主要用于辅助诊断和生成建议，不负责默认执行真实变更操作。
 
-#### 3.2.1 Basic RAG Retriever
+## 9. MCP 工具架构
 
-**文件**: `app/retriever/basic.py`
+系统通过 MCP 将外部工具抽象为 LLM 可调用工具。
 
-**流程**: 简单的向量相似度检索
-
-```
-Query -> Embedding -> Milvus ANN Search -> Top-K Documents
-```
-
-#### 3.2.2 Enhanced RAG Retriever
-
-**文件**: `app/retriever/enhanced.py`
-
-**流程**: 三阶段增强检索
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│ Stage 1: Query Preprocessing                                │
-│   - none: 直接使用原始查询                                   │
-│   - rewrite: LLM 语义改写                                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│ Stage 2: Hybrid Search (粗排)                               │
-│   - Dense ANN: DashScope text-embedding-v4 (COSINE)         │
-│   - Sparse BM25: Milvus 内置 BM25 (Jieba 中文分词)          │
-│   - RRF 融合 (k=60)                                         │
-│   - 候选数: rerank_coarse_top_k (默认 20)                   │
-└─────────────────────────────────────────────────────────────┘
-                              │
-┌─────────────────────────────────────────────────────────────┐
-│ Stage 3: Reranking (精排)                                   │
-│   - none: 直接截断到 top_k                                  │
-│   - cross_encoder: BGE bge-reranker-v2-m3                   │
-│   - 使用原始查询打分（非改写后查询）                          │
-└─────────────────────────────────────────────────────────────┘
+```text
+Agent
+  -> MultiServerMCPClient
+  -> CLS MCP Server
+  -> Monitor MCP Server
 ```
 
-**关键设计决策**:
-- 预处理后的查询用于混合检索，提升召回
-- 精排始终使用**原始查询**打分，确保分数反映用户真实意图
+当前 MCP 服务：
 
-### 3.3 向量存储系统
+| 服务 | 默认端口 | 作用 |
+|---|---:|---|
+| CLS MCP Server | 8003 | 模拟日志主题查询、日志搜索 |
+| Monitor MCP Server | 8004 | 模拟 CPU、内存等监控指标查询 |
 
-#### 3.3.1 Milvus Collection 设计
+MCP Client 具备指数退避重试能力。当工具失败时，会重试并记录错误结果，避免单次失败直接中断整个诊断流程。
 
-**基础 Collection (`biz`)**:
-```python
-fields = [
-    FieldSchema(name="id", dtype=VARCHAR, max_length=100, is_primary=True),
-    FieldSchema(name="vector", dtype=FLOAT_VECTOR, dim=1024),
-    FieldSchema(name="content", dtype=VARCHAR, max_length=8000),
-    FieldSchema(name="metadata", dtype=JSON),
-]
-# 索引: IVF_FLAT, metric=L2
+## 10. 数据存储架构
+
+| 数据 | 存储 |
+|---|---|
+| 文档向量 | Milvus |
+| 稀疏检索数据 | Milvus BM25 Function / Enhanced Collection |
+| 会话状态 | RedisSaver 或 MemorySaver |
+| 诊断报告 | Redis 或本地 JSON 文件 |
+| Agent Trace | TraceStore，支持文件或 Redis 后端 |
+| 日志 | Loguru 本地日志文件 |
+| 评估结果 | `reports/` 目录下 JSON / CSV |
+
+## 11. 主要数据流
+
+### 11.1 RAG 问答数据流
+
+```text
+User Question
+  -> /api/chat or /api/chat_stream
+  -> RagAgentService
+  -> LLM decides retrieve_knowledge
+  -> Retriever searches Milvus
+  -> Documents formatted as context
+  -> LLM generates answer
+  -> API returns answer / SSE tokens
 ```
 
-**增强 Collection (`biz_enhanced`)**:
-```python
-fields = [
-    FieldSchema(name="id", dtype=VARCHAR, max_length=100, is_primary=True),
-    FieldSchema(name="dense_vector", dtype=FLOAT_VECTOR, dim=1024),
-    FieldSchema(name="content_text", dtype=VARCHAR, max_length=8000, 
-                enable_analyzer=True, analyzer_params={"type": "chinese"}),
-    FieldSchema(name="sparse_vector", dtype=SPARSE_FLOAT_VECTOR),  # BM25 自动生成
-    FieldSchema(name="metadata", dtype=JSON),
-]
-# 索引: 
-#   - dense_vector: IVF_FLAT, metric=COSINE
-#   - sparse_vector: SPARSE_INVERTED_INDEX, metric=BM25
+### 11.2 AIOps 诊断数据流
+
+```text
+Diagnosis Request
+  -> /api/aiops
+  -> AIOpsService
+  -> Planner creates plan
+  -> Executor calls tools
+  -> MCP Client calls CLS / Monitor servers
+  -> Replanner evaluates evidence
+  -> Final report generated
+  -> DiagnosisStore saves record
+  -> TraceStore saves trace
 ```
 
-### 3.4 MCP 工具系统
+### 11.3 文档索引数据流
 
-#### 3.4.1 MCP 客户端
-
-**文件**: `app/agent/mcp_client.py`
-
-**职责**: 管理 MCP 服务器连接，提供工具调用能力
-
-**关键特性**:
-- 全局单例模式，避免重复初始化
-- 重试拦截器：指数退避策略（最多 3 次重试）
-- 支持多服务器配置
-
-**配置示例**:
-```python
-mcp_servers = {
-    "cls": {
-        "transport": "streamable-http",
-        "url": "http://localhost:8003/mcp"
-    },
-    "monitor": {
-        "transport": "streamable-http",
-        "url": "http://localhost:8004/mcp"
-    }
-}
+```text
+Upload / Index Directory
+  -> VectorIndexService
+  -> DocumentSplitterService
+  -> Embedding Service
+  -> Milvus Basic Collection
+  -> Milvus Enhanced Collection
 ```
 
-#### 3.4.2 MCP 服务器
+## 12. 配置架构
 
-**文件**: `mcp_servers/`
+系统配置集中在 `app/config.py`，通过 `.env` 注入。
 
-| 服务器 | 端口 | 功能 |
-|--------|------|------|
-| `cls_server.py` | 8003 | 云日志服务查询 |
-| `monitor_server.py` | 8004 | 监控指标查询 |
+主要配置域：
 
----
+| 配置域 | 示例 |
+|---|---|
+| LLM | `DASHSCOPE_MODEL`、`LLM_TIMEOUT`、`LLM_MAX_RETRIES` |
+| Embedding | `DASHSCOPE_EMBEDDING_MODEL` |
+| Milvus | `MILVUS_HOST`、`MILVUS_PORT`、`MILVUS_NPROBE` |
+| RAG | `RAG_MODE`、`RAG_TOP_K` |
+| Enhanced RAG | `QUERY_PREPROCESSOR_TYPE`、`RERANKER_TYPE`、`RERANK_COARSE_TOP_K` |
+| Redis | `REDIS_URL` |
+| MCP | `MCP_CLS_URL`、`MCP_MONITOR_URL` |
+| Eval | `EVAL_JUDGE_MODEL`、`EVAL_JUDGE_API_BASE` |
 
-## 4. API 接口规范
+## 13. 部署架构
 
-### 4.1 对话接口
+本地部署由三类进程组成：
 
-**POST** `/api/chat`
+```text
+Docker Compose
+  -> Milvus
+  -> Etcd
+  -> MinIO
+  -> Attu
+  -> Redis
 
-请求:
-```json
-{
-    "question": "如何处理 CPU 高使用率问题？",
-    "session_id": "session-123"
-}
+Python Processes
+  -> FastAPI App :9900
+  -> CLS MCP Server :8003
+  -> Monitor MCP Server :8004
+
+External Services
+  -> DashScope LLM API
+  -> DashScope Embedding API
 ```
 
-响应（SSE 流式）:
-```
-event: message
-data: {"type": "content", "data": "根据知识库..."}
+访问入口：
 
-event: message
-data: {"type": "complete"}
-```
+| 服务 | 地址 |
+|---|---|
+| Web UI | `http://localhost:9900` |
+| API Docs | `http://localhost:9900/docs` |
+| CLS MCP | `http://localhost:8003/mcp` |
+| Monitor MCP | `http://localhost:8004/mcp` |
+| Milvus | `localhost:19530` |
+| Attu | `http://localhost:8000` |
 
-### 4.2 文件上传接口
+## 14. 可观测性
 
-**POST** `/api/files/upload`
+当前可观测性能力：
 
-请求: `multipart/form-data`
-- `file`: 文件内容
-- `collection_name`: 集合名称（可选）
+- Loguru 本地日志。
+- Agent 节点 trace。
+- RAG trace。
+- 工具调用 trace。
+- token usage 记录。
+- Prometheus `/metrics` 端点。
+- SSE 诊断过程事件。
 
-响应:
-```json
-{
-    "message": "文件上传成功",
-    "filename": "document.pdf",
-    "chunks_count": 15
-}
-```
+建议继续增强：
 
-### 4.3 AIOps 诊断接口
+- 统一 trace_id 贯穿 API、Agent、Tool、Report。
+- 工具调用参数和返回值标准化。
+- 增加 trajectory quality 评估。
+- 增加错误分类和失败原因聚合。
+- 增加线上延迟、成本、成功率看板。
 
-**POST** `/api/aiops`
+## 15. 安全边界
 
-请求:
-```json
-{
-    "session_id": "session-123"
-}
-```
+当前系统主要用于诊断辅助和本地演示，默认不执行真实生产变更操作。
 
-响应（SSE 流式事件类型）:
+后续若接入执行类工具，必须补充：
 
-| 事件类型 | 说明 |
-|----------|------|
-| `status` | 状态更新 |
-| `plan` | 诊断计划制定完成 |
-| `step_complete` | 步骤执行完成 |
-| `report` | 最终诊断报告 |
-| `complete` | 诊断完成 |
-| `error` | 错误信息 |
+- 用户身份认证。
+- RBAC 权限控制。
+- 操作分级。
+- 人工审批。
+- dry-run。
+- 回滚机制。
+- 执行后验证。
+- 审计日志。
 
-### 4.4 健康检查接口
+建议操作分级：
 
-**GET** `/api/health`
+| 等级 | 类型 | 策略 |
+|---|---|---|
+| L0 | 只读查询 | 可自动执行 |
+| L1 | 低风险诊断操作 | 自动执行并记录 |
+| L2 | 可逆变更 | 需要人工审批 |
+| L3 | 高风险变更 | 多人审批和变更窗口 |
+| L4 | 破坏性操作 | 默认禁止 |
 
-响应:
-```json
-{
-    "status": "healthy",
-    "milvus": "connected"
-}
-```
+## 16. 评估架构
 
----
+系统提供三类评估：
 
-## 5. 配置说明
+| 评估 | 脚本 | 目标 |
+|---|---|---|
+| RAG Eval | `tests/evaluation/evaluate_rag.py` | 评估检索质量和生成质量 |
+| Agent Eval | `tests/evaluation/evaluate_agent.py` | 评估工具调用准确率和目标达成 |
+| AIOps Eval | `tests/evaluation/evaluate_aiops_agent.py` | 评估诊断计划、工具调用、结论命中 |
 
-### 5.1 环境变量
+已有指标：
 
-| 变量名 | 默认值 | 说明 |
-|--------|--------|------|
-| `APP_NAME` | SuperBizAgent | 应用名称 |
-| `APP_VERSION` | 1.0.0 | 应用版本 |
-| `DEBUG` | False | 调试模式 |
-| `HOST` | 0.0.0.0 | 监听地址 |
-| `PORT` | 9900 | 监听端口 |
-| `DASHSCOPE_API_KEY` | - | DashScope API 密钥 |
-| `DASHSCOPE_MODEL` | qwen-max | LLM 模型 |
-| `DASHSCOPE_EMBEDDING_MODEL` | text-embedding-v4 | 嵌入模型 |
-| `MILVUS_HOST` | localhost | Milvus 地址 |
-| `MILVUS_PORT` | 19530 | Milvus 端口 |
-| `RAG_MODE` | basic | RAG 模式（basic/enhanced） |
-| `RAG_TOP_K` | 3 | 检索文档数 |
-| `QUERY_PREPROCESSOR_TYPE` | none | 查询预处理方式 |
-| `RERANKER_TYPE` | cross_encoder | 精排器类型 |
-| `RERANKER_MODEL` | BAAI/bge-reranker-v2-m3 | 精排模型 |
+- context precision。
+- context recall。
+- hit rate。
+- MRR。
+- faithfulness。
+- answer relevancy。
+- tool exact match。
+- tool precision。
+- tool recall。
+- goal accuracy。
 
-### 5.2 RAG 模式配置
+建议补充指标：
 
-**Basic 模式**:
-```env
-RAG_MODE=basic
-RAG_TOP_K=3
-```
+- Tool Argument Accuracy。
+- RCA Correctness。
+- Evidence Coverage。
+- Citation Accuracy。
+- Hallucination Rate。
+- Trajectory Quality。
+- Error Recovery Rate。
+- Latency P95。
+- Cost per Diagnosis。
 
-**Enhanced 模式**:
-```env
-RAG_MODE=enhanced
-QUERY_PREPROCESSOR_TYPE=rewrite
-RERANKER_TYPE=cross_encoder
-RERANKER_MODEL=BAAI/bge-reranker-v2-m3
-RERANKER_TOP_K=3
-RERANK_COARSE_TOP_K=20
-```
+## 17. 当前架构限制
 
----
+1. 当前不是完整多 Agent 架构，而是单诊断 Agent 的多节点工作流。
+2. 系统主要支持诊断和建议生成，不支持生产级自动处置闭环。
+3. RAG 回答尚未强制绑定引用证据。
+4. 工具调用参数校验仍需增强。
+5. 知识库缺少版本、过期和审核机制。
+6. 评估数据集规模仍需扩充。
+7. 权限、审批、回滚和审计能力尚未形成。
 
-## 6. 部署架构
+## 18. 后续演进方向
 
-### 6.1 依赖服务
+短期：
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    SuperBizAgent                            │
-│                    (FastAPI :9900)                          │
-└─────────────────────────────────────────────────────────────┘
-         │              │              │              │
-         ▼              ▼              ▼              ▼
-┌─────────────┐ ┌─────────────┐ ┌─────────────┐ ┌─────────────┐
-│ Milvus      │ │ DashScope   │ │ MCP CLS     │ │ MCP Monitor │
-│ :19530      │ │ API         │ │ :8003       │ │ :8004       │
-└─────────────┘ └─────────────┘ └─────────────┘ └─────────────┘
-```
+- 强化工具参数 schema 校验。
+- 增加 RAG 引用和证据链输出。
+- 扩展评估集并纳入 CI。
+- 优化 MCP 工具异常处理。
 
-### 6.2 启动命令
+中期：
 
-```bash
-# 安装依赖
-uv sync
+- 接入真实告警事件。
+- 增加 Ticket / 工单集成。
+- 增加人工审批和操作分级。
+- 增加处置后 Verification Agent。
+- 增加知识版本和 freshness 治理。
 
-# 启动 Milvus
-docker-compose -f vector-database.yml up -d
+长期：
 
-# 启动 MCP 服务器
-python mcp_servers/cls_server.py &
-python mcp_servers/monitor_server.py &
+- 演进为 Supervisor 多 Agent 架构。
+- 建立 Evidence Graph。
+- 引入 Runbook DSL。
+- 支持半自动或自动化处置。
+- 建立线上持续评估和 Shadow Mode。
 
-# 启动应用
-uv run python -m app.main
-```
+## 19. 总结
 
----
+OnCall Mind 当前已经具备智能运维诊断助手的核心技术底座：RAG、Agent 编排、MCP 工具调用、诊断报告、Trace 和评估体系。现阶段架构适合作为智能运维辅助分析平台或 AIOps 原型系统。
 
-## 7. 架构优化建议
-
-### 7.1 当前问题
-
-| 问题 | 影响 | 优先级 |
-|------|------|--------|
-| **服务层耦合** | RagAgentService 职责过重，直接依赖 MCP 客户端 | 高 |
-| **向量存储分散** | 存在两套向量存储管理器，代码重复 | 高 |
-| **错误恢复不足** | AIOps 流程中步骤失败后缺乏重试/回退 | 中 |
-| **配置热更新缺失** | 无法运行时调整参数 | 中 |
-| **测试覆盖不足** | 仅有 RAG 评估测试，缺少单元测试 | 中 |
-| **会话持久化** | MemorySaver 重启后丢失 | 低 |
-
-### 7.2 优化方案
-
-#### 7.2.1 抽取工具注册中心
-
-```python
-# 建议新增: app/tools/registry.py
-class ToolRegistry:
-    def __init__(self):
-        self._tools = {}
-    
-    def register(self, name: str, tool):
-        self._tools[name] = tool
-    
-    def get_all_tools(self) -> List:
-        return list(self._tools.values())
-```
-
-#### 7.2.2 统一向量存储管理器
-
-```python
-# 建议合并为: app/services/vector_store_manager.py
-class VectorStoreManager:
-    def __init__(self, mode: Literal["basic", "enhanced"]):
-        self.mode = mode
-        # 统一接口
-```
-
-#### 7.2.3 添加错误处理节点
-
-```python
-# 在 StateGraph 中添加
-workflow.add_node("error_handler", error_handler_node)
-workflow.add_edge(NODE_EXECUTOR, "error_handler")
-```
-
-#### 7.2.4 引入 Redis 会话持久化
-
-```python
-# 替换 MemorySaver
-from langgraph.checkpoint.redis import RedisSaver
-checkpointer = RedisSaver.from_conn_string("redis://localhost:6379")
-```
-
----
-
-## 8. 需求实现清单
-
-### 8.1 已实现功能
-
-| 功能模块 | 功能点 | 状态 | 说明 |
-|----------|--------|------|------|
-| **RAG Agent** | 对话式问答 | ✅ 完整 | 支持多轮对话 |
-| | 知识检索 | ✅ 完整 | Basic/Enhanced 两种模式 |
-| | 流式输出 | ✅ 完整 | SSE 实时推送 |
-| | 会话管理 | ✅ 完整 | MemorySaver |
-| **AIOps Agent** | Plan-Execute-Replan | ✅ 完整 | LangGraph 实现 |
-| | 自动诊断 | ✅ 完整 | 告警获取+分析+报告 |
-| | 流式诊断过程 | ✅ 完整 | SSE 事件流 |
-| **向量存储** | 文档上传 | ✅ 完整 | 支持多种格式 |
-| | 文档分块 | ✅ 完整 | 递归字符分块 |
-| | 向量嵌入 | ✅ 完整 | DashScope API |
-| | 混合检索 | ✅ 完整 | Dense + BM25 + RRF |
-| | 精排优化 | ✅ 完整 | Cross-Encoder |
-| **MCP 工具** | CLS 日志查询 | ✅ 完整 | MCP 服务器 |
-| | 监控指标查询 | ✅ 完整 | MCP 服务器 |
-| | 重试机制 | ✅ 完整 | 指数退避 |
-| **API** | 对话接口 | ✅ 完整 | /api/chat |
-| | 文件上传 | ✅ 完整 | /api/files/upload |
-| | AIOps 诊断 | ✅ 完整 | /api/aiops |
-| | 健康检查 | ✅ 完整 | /api/health |
-
-### 8.2 未实现/待完善功能
-
-| 功能模块 | 功能点 | 优先级 | 说明 |
-|----------|--------|--------|------|
-| **RAG 评估** | 自动化评估流程 | 高 | `eval.md` 提到但未完全实现 |
-| | 评估指标计算 | 高 | RAGAS 指标 |
-| | 评估报告生成 | 中 | 对比报告 |
-| **前端 UI** | 诊断结果可视化 | 中 | 当前仅有基础 UI |
-| | 实时诊断进度 | 中 | WebSocket/SSE 展示 |
-| **告警系统** | 主动推送机制 | 中 | 当前仅被动查询 |
-| | 告警订阅管理 | 低 | 多租户告警隔离 |
-| **持久化** | 会话历史持久化 | 低 | 当前使用内存 |
-| | 诊断报告存储 | 低 | 历史报告查询 |
-| **多租户** | 租户隔离 | 低 | 当前无隔离 |
-| | 权限控制 | 低 | RBAC |
-| **可观测性** | 链路追踪 | 低 | OpenTelemetry |
-| | 指标监控 | 低 | Prometheus |
-
-### 8.3 接口实现状态
-
-| 接口路径 | 方法 | 状态 | 备注 |
-|----------|------|------|------|
-| `/api/chat` | POST | ✅ 已实现 | 流式对话 |
-| `/api/chat/history` | GET | ✅ 已实现 | 获取会话历史 |
-| `/api/chat/clear` | DELETE | ✅ 已实现 | 清空会话 |
-| `/api/files/upload` | POST | ✅ 已实现 | 文件上传 |
-| `/api/files/collections` | GET | ✅ 已实现 | 获取集合列表 |
-| `/api/files/collections/{name}` | DELETE | ✅ 已实现 | 删除集合 |
-| `/api/aiops` | POST | ✅ 已实现 | AIOps 诊断 |
-| `/api/health` | GET | ✅ 已实现 | 健康检查 |
-
----
-
+下一阶段的架构重点应从“能回答、能诊断”转向“有证据、可追溯、可评估、可审批、可验证”。在完成工具参数可靠性、证据链、权限审批和评估闭环后，系统才能进一步演进为生产级 Multi-Agent AIOps 平台。

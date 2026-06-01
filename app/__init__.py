@@ -1,6 +1,6 @@
-"""SuperBizAgent Python 版本
+"""OnCall Mind
 
-基于 LangChain 的智能业务代理系统
+基于 LangChain 的智能 On-Call 运维 Agent 系统
 """
 
 __version__ = "1.0.0"

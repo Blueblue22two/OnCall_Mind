@@ -34,9 +34,10 @@ def compute_tool_call_accuracy(
     # Exact Match: 集合完全相等
     exact_match: bool = actual_names == expected_names
 
-    # Precision: |actual ∩ expected| / |actual|，actual 为空时返回 0.0
+    # Precision: |actual ∩ expected| / |actual|
+    # actual 为空时，若 expected 也为空则精确率 1.0（什么都没调 = 完美），否则 0.0
     if not actual_names:
-        precision: float = 0.0
+        precision: float = 1.0 if not expected_names else 0.0
     else:
         precision = len(actual_names & expected_names) / len(actual_names)
 
