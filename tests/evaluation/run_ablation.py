@@ -7,14 +7,24 @@
   python -m tests.evaluation.run_ablation --output reports/ablation.csv
 
 工作原理：
-  1. 定义参数组合（rag_mode × top_k × reranker_type × query_preprocessor_type）
+  1. 定义参数组合（rag_mode × top_k × reranker_type × query_preprocessor_type
+     × coarse_top_k × model）
   2. 每个组合通过子进程运行 evaluate_rag.py，注入环境变量
   3. 收集所有 JSON 结果，汇总为对比 CSV
 
+消融维度：
+  - rag_mode: basic / enhanced
+  - top_k: 3 / 5 / 10
+  - reranker_type: none / cross_encoder
+  - query_preprocessor_type: none / rewrite
+  - coarse_top_k: 10 / 20（enhanced 模式候选池大小）
+  - generation_model: qwen-max / qwen-plus（生成模型对比）
+
 局限：
   - chunk_size 不纳入消融（需重新入库文档，不适合脚本自动化）
+  - embedding 模型不纳入消融（需重新入库文档）
   - 每个组合独立启动子进程，含完整 Milvus 连接 + 模型加载，耗时长
-  - 消融实验的总时间 ≈ 组合数 × 单次评估时间（约 10+ 组合 × 2-5分钟）
+  - 消融实验的总时间 ≈ 组合数 × 单次评估时间（约 15+ 组合 × 2-5分钟）
 
 输出文件：
   - ablation CSV：每个组合一行，列包含参数 + 各项指标
@@ -113,6 +123,42 @@ ABLATION_COMBINATIONS = [
         "RERANKER_TYPE": "cross_encoder",
         "RERANK_COARSE_TOP_K": "20",
         "RERANKER_TOP_K": "5",
+    },
+    # --- coarse_top_k 消融：候选池大小对精排的影响 ---
+    {
+        "label": "enhanced (cross_encoder, coarse=10) k=5",
+        "RAG_MODE": "enhanced",
+        "QUERY_PREPROCESSOR_TYPE": "none",
+        "RERANKER_TYPE": "cross_encoder",
+        "RERANK_COARSE_TOP_K": "10",
+        "RERANKER_TOP_K": "5",
+    },
+    {
+        "label": "enhanced (cross_encoder, coarse=30) k=5",
+        "RAG_MODE": "enhanced",
+        "QUERY_PREPROCESSOR_TYPE": "none",
+        "RERANKER_TYPE": "cross_encoder",
+        "RERANK_COARSE_TOP_K": "30",
+        "RERANKER_TOP_K": "5",
+    },
+    # --- 生成模型消融：对比不同 LLM 对 generation 指标的影响 ---
+    {
+        "label": "enhanced (cross_encoder) k=5, model=qwen-plus",
+        "RAG_MODE": "enhanced",
+        "QUERY_PREPROCESSOR_TYPE": "none",
+        "RERANKER_TYPE": "cross_encoder",
+        "RERANK_COARSE_TOP_K": "20",
+        "RERANKER_TOP_K": "5",
+        "RAG_MODEL": "qwen-plus",
+    },
+    {
+        "label": "enhanced (cross_encoder) k=5, model=qwen-max",
+        "RAG_MODE": "enhanced",
+        "QUERY_PREPROCESSOR_TYPE": "none",
+        "RERANKER_TYPE": "cross_encoder",
+        "RERANK_COARSE_TOP_K": "20",
+        "RERANKER_TOP_K": "5",
+        "RAG_MODEL": "qwen-max",
     },
 ]
 
@@ -213,6 +259,8 @@ def run_ablation(output_path: str | None = None):
                 "top_k": s["top_k"],
                 "context_precision": s["retrieval_metrics"]["context_precision"],
                 "context_recall": s["retrieval_metrics"]["context_recall"],
+                "context_relevancy": s["retrieval_metrics"].get("context_relevancy"),
+                "context_entity_recall": s["retrieval_metrics"].get("context_entity_recall"),
             }
             # 非 LLM 指标
             nlm = s.get("non_llm_metrics", {})
@@ -252,7 +300,7 @@ def _print_ablation_summary(all_scores: list[dict]):
     print("  消融实验摘要")
     print("=" * 90)
     header = (
-        f"  {'组合':<38} {'cp':>8} {'cr':>8} {'hit@3':>8} {'mrr':>8}"
+        f"  {'组合':<38} {'cp':>8} {'cr':>8} {'crel':>8} {'cer':>8} {'hit@3':>8} {'mrr':>8}"
     )
     print(header)
     print("-" * 90)
@@ -261,10 +309,12 @@ def _print_ablation_summary(all_scores: list[dict]):
         label = s["_ablation_label"][:36]
         cp = s["retrieval_metrics"]["context_precision"]
         cr = s["retrieval_metrics"]["context_recall"]
+        crel = s["retrieval_metrics"].get("context_relevancy", 0)
+        cer = s["retrieval_metrics"].get("context_entity_recall", 0)
         nlm = s.get("non_llm_metrics", {})
         h3 = nlm.get("hit_rate@3", 0)
         mr = nlm.get("mrr", 0)
-        print(f"  {label:<38} {cp:>8.4f} {cr:>8.4f} {h3:>8.4f} {mr:>8.4f}")
+        print(f"  {label:<38} {cp:>8.4f} {cr:>8.4f} {crel:>8.4f} {cer:>8.4f} {h3:>8.4f} {mr:>8.4f}")
 
     # 找出最优组合
     best = max(all_scores, key=lambda s: (
@@ -296,7 +346,6 @@ if __name__ == "__main__":
 
     if args.combos:
         indices = [int(i.strip()) for i in args.combos.split(",")]
-        global ABLATION_COMBINATIONS  # noqa: F824
         ABLATION_COMBINATIONS = [ABLATION_COMBINATIONS[i] for i in indices]
         logger.info(f"仅运行 {len(ABLATION_COMBINATIONS)} 个选定组合: {args.combos}")
 

@@ -43,6 +43,74 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         super().__init__()
         self.last_retrieval_meta: Dict[str, Any] = {}
 
+    @staticmethod
+    def _doc_dedupe_key(doc: Document) -> str:
+        """生成文档去重 key，优先使用来源和标题，缺失时退回内容前缀。"""
+        metadata = doc.metadata or {}
+        source = metadata.get("_source") or metadata.get("_file_name") or ""
+        headers = "|".join(
+            str(metadata.get(key, "")) for key in ("h1", "h2", "h3") if metadata.get(key)
+        )
+        if source or headers:
+            return f"{source}::{headers}::{doc.page_content[:80]}"
+        return doc.page_content[:200]
+
+    @classmethod
+    def _merge_candidates(cls, *candidate_lists: list[Document]) -> list[Document]:
+        """按召回顺序合并候选，并去除同一分片的重复结果。"""
+        merged: list[Document] = []
+        seen: set[str] = set()
+        for candidates in candidate_lists:
+            for doc in candidates:
+                key = cls._doc_dedupe_key(doc)
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(doc)
+        return merged
+
+    @staticmethod
+    def _doc_file_key(doc: Document) -> str:
+        """生成文档来源 key，用于最终 Top-K 的来源多样性选择。"""
+        metadata = doc.metadata or {}
+        return str(
+            metadata.get("_file_name")
+            or metadata.get("_source")
+            or metadata.get("source")
+            or ""
+        )
+
+    @classmethod
+    def _diversify_by_file(cls, documents: list[Document], top_k: int) -> list[Document]:
+        """按 rerank 顺序优先覆盖不同来源文件，再补充同文件后续分片。
+
+        该策略不改变 reranker 给出的相对顺序，只在最终截断前减少同一
+        _file_name 连续占满 Top-K 的情况，用于改善 cross_doc 查询的证据覆盖。
+        """
+        if len(documents) <= top_k:
+            return documents
+
+        selected: list[Document] = []
+        deferred: list[Document] = []
+        seen_files: set[str] = set()
+
+        for doc in documents:
+            file_key = cls._doc_file_key(doc)
+            if file_key and file_key not in seen_files:
+                selected.append(doc)
+                seen_files.add(file_key)
+                if len(selected) >= top_k:
+                    return selected[:top_k]
+            else:
+                deferred.append(doc)
+
+        for doc in deferred:
+            if len(selected) >= top_k:
+                break
+            selected.append(doc)
+
+        return selected[:top_k]
+
     def retrieve(self, query: str, top_k: int, debug: bool = False) -> list[Document]:
         """执行完整增强检索 pipeline
 
@@ -70,6 +138,10 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             "degraded_stage": None,
             "fallback_reason": None,
             "candidate_count": 0,
+            "rewritten_candidate_count": 0,
+            "original_candidate_count": 0,
+            "rerank_pool_k": 0,
+            "diversify_by_file": config.rag_diversify_by_file,
             "final_count": 0,
             "total_time_ms": 0,
         }
@@ -102,11 +174,26 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         # ----------------------------------------------------------------
         coarse_top_k = config.rerank_coarse_top_k
         t_stage2 = time.time()
-        candidates = enhanced_vector_store_manager.hybrid_search(
+        rewritten_candidates = enhanced_vector_store_manager.hybrid_search(
             query=search_query,
             top_k=coarse_top_k,
             coarse_top_k=coarse_top_k,
         )
+        candidates = rewritten_candidates
+
+        # rewrite 可能提升语义召回，但也可能稀释原始关键词。额外保留原始 query
+        # 的召回结果，再去重合并，兼顾口语化查询和精确术语查询。
+        original_candidates: list[Document] = []
+        if search_query.strip() != original_query.strip():
+            original_candidates = enhanced_vector_store_manager.hybrid_search(
+                query=original_query,
+                top_k=coarse_top_k,
+                coarse_top_k=coarse_top_k,
+            )
+            candidates = self._merge_candidates(rewritten_candidates, original_candidates)
+
+        meta["rewritten_candidate_count"] = len(rewritten_candidates)
+        meta["original_candidate_count"] = len(original_candidates)
         meta["candidate_count"] = len(candidates)
         meta["hybrid_search_time_ms"] = int((time.time() - t_stage2) * 1000)
 
@@ -122,6 +209,8 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         logger.info(
             f"[Enhanced][{trace_id}] Stage2-混合检索完成: "
             f"candidates={len(candidates)}, "
+            f"rewrite_candidates={len(rewritten_candidates)}, "
+            f"original_candidates={len(original_candidates)}, "
             f"coarse_top_k={coarse_top_k}, "
             f"耗时={meta['hybrid_search_time_ms']}ms"
         )
@@ -131,18 +220,32 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         # 注意：精排使用 original_query，而非 search_query（可能是改写后的查询）
         # ----------------------------------------------------------------
         t_stage3 = time.time()
+        rerank_pool_k = top_k
+        if config.rag_diversify_by_file:
+            multiplier = max(1, config.rag_diversify_candidate_multiplier)
+            rerank_pool_k = min(len(candidates), max(top_k, top_k * multiplier))
+        meta["rerank_pool_k"] = rerank_pool_k
+
         try:
             reranker = get_reranker(config.reranker_type, config.reranker_model)
-            final_docs = reranker.rerank(
+            reranked_docs = reranker.rerank(
                 query=original_query,
                 documents=candidates,
-                top_k=top_k,
+                top_k=rerank_pool_k,
             )
+            if config.rag_diversify_by_file:
+                final_docs = self._diversify_by_file(reranked_docs, top_k=top_k)
+            else:
+                final_docs = reranked_docs[:top_k]
         except Exception as e:
             logger.warning(
                 f"[Enhanced][{trace_id}] 精排失败，回退到粗排截断 top_k={top_k}: {e}"
             )
-            final_docs = candidates[:top_k]
+            fallback_docs = candidates[:rerank_pool_k]
+            if config.rag_diversify_by_file:
+                final_docs = self._diversify_by_file(fallback_docs, top_k=top_k)
+            else:
+                final_docs = fallback_docs[:top_k]
             if meta["degraded_stage"] is None:
                 meta["degraded_stage"] = "reranker"
             else:
@@ -169,7 +272,9 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             f"[Enhanced][{trace_id}] 检索完成: "
             f"preprocessor={config.query_preprocessor_type}, "
             f"reranker={config.reranker_type}, "
-            f"candidates={len(candidates)}, final={len(final_docs)}, "
+            f"candidates={len(candidates)}, rerank_pool={rerank_pool_k}, "
+            f"diversify_by_file={config.rag_diversify_by_file}, "
+            f"final={len(final_docs)}, "
             f"total_ms={meta['total_time_ms']}, "
             f"{degraded_info}"
         )

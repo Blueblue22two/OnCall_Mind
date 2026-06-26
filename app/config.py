@@ -66,14 +66,16 @@ class Settings(BaseSettings):
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_top_k: int = 3          # enhanced 模式最终返回数（精排后截断）
     rerank_coarse_top_k: int = 10    # enhanced 模式粗排候选数（P0-1.3: 20→10 精排耗时减半）
+    rag_diversify_by_file: bool = False  # 是否在 Enhanced 最终 Top-K 中优先覆盖不同来源文件
+    rag_diversify_candidate_multiplier: int = 3  # 多样性选择前保留的精排候选倍数
 
     # ------------------------------------------------------------------
     # 评估 Judge 配置（独立于线上 RAG 模型，确保评估可复现）
     # ------------------------------------------------------------------
     eval_judge_model: str = "qwen3.5-plus"
     eval_judge_temperature: float = 0.0
-    eval_judge_api_base: str = "input your api base"   # 空则复用 DASHSCOPE_API_BASE
-    eval_judge_api_key: str = "Input your api key"    # 空则复用 DASHSCOPE_API_KEY
+    eval_judge_api_base: str = ""   # 空则复用 DASHSCOPE_API_BASE
+    eval_judge_api_key: str = ""    # 空则复用 DASHSCOPE_API_KEY
 
     # 文档分块配置
     chunk_max_size: int = 800

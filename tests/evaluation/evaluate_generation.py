@@ -594,22 +594,60 @@ async def run_generation_evaluation(
         cat_metrics["avg_latency_ms"] = _safe_mean([s.get("latency_ms") for s in items])
         category_breakdown[cat] = cat_metrics
 
-    # 低质量样本识别
-    LOW_THRESHOLDS = {
-        "faithfulness": 0.5,
-        "answer_correctness": 0.4,
-        "answer_completeness": 0.7,
-        "hallucination_score": 0.7,
-        "semantic_similarity": 0.3,
+    # 低质量样本识别（基于数据分布百分位数动态校准）
+    def _calc_percentile_threshold(values: list, percentile: float = 10.0) -> float:
+        """计算分位数阈值，用于低质量标记。"""
+        valid = sorted([v for v in values if v is not None])
+        if not valid:
+            return 0.0
+        idx = max(0, int(len(valid) * percentile / 100))
+        return valid[idx]
+
+    # 度量名称 → 使用的百分位数（分数越低越差的指标用 P25，越高越差的用 P75）
+    PERCENTILE_CONFIG = {
+        "faithfulness": 25,           # 低分为差
+        "answer_relevancy": 25,
+        "answer_correctness": 25,
+        "answer_completeness": 25,
+        "hallucination_score": 75,    # 高分为差（0=无幻觉, 2=严重幻觉）
+        "semantic_similarity": 25,
     }
+
+    # 基于实际数据分布计算阈值
+    LOW_THRESHOLDS = {}
+    for metric, percentile in PERCENTILE_CONFIG.items():
+        all_vals = [s.get(metric) for s in per_question]
+        threshold = _calc_percentile_threshold(all_vals, percentile)
+        if percentile > 50:
+            # 分数越高越差的指标（hallucination），阈值以上视为低质量
+            LOW_THRESHOLDS[metric] = {
+                "threshold": threshold,
+                "comparison": "gt",
+                "percentile": percentile,
+            }
+        else:
+            LOW_THRESHOLDS[metric] = {
+                "threshold": threshold,
+                "comparison": "lt",
+                "percentile": percentile,
+            }
+        logger.info(
+            f"  低质量阈值 {metric}: {'>' if percentile > 50 else '<'} "
+            f"{threshold:.2f} (P{percentile})"
+        )
 
     low_quality_samples = []
     for s in per_question:
         low_flags = []
-        for metric, threshold in LOW_THRESHOLDS.items():
+        for metric, config in LOW_THRESHOLDS.items():
             val = s.get(metric)
-            if val is not None and val < threshold:
-                low_flags.append(f"{metric}={val:.2f}<{threshold}")
+            if val is None:
+                continue
+            threshold = config["threshold"]
+            if config["comparison"] == "gt" and val > threshold:
+                low_flags.append(f"{metric}={val:.2f}>{threshold:.2f}(P{config['percentile']})")
+            elif config["comparison"] == "lt" and val < threshold:
+                low_flags.append(f"{metric}={val:.2f}<{threshold:.2f}(P{config['percentile']})")
 
         if low_flags:
             low_quality_samples.append({

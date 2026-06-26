@@ -141,7 +141,7 @@ class EnhancedVectorStoreManager:
             dense_req = AnnSearchRequest(
                 data=[query_dense_vec],
                 anns_field="dense_vector",
-                param={"metric_type": "COSINE", "params": {"nprobe": 16}},
+                param={"metric_type": "COSINE", "params": {"nprobe": config.milvus_nprobe}},
                 limit=coarse_k,
             )
 

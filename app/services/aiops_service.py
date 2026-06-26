@@ -1,6 +1,5 @@
 """
 通用 Plan-Execute-Replan 服务
-基于 LangGraph 官方教程实现
 
 P1-2.1: 集成 TraceStore，生成 trace_id 并随状态传递，结束时保存完整 trace
 P1-2.2: 增加 error_handler 节点，统一错误处理与 fallback
@@ -72,16 +71,14 @@ class AIOpsService:
 
     def __init__(self):
         """初始化服务"""
-        # P1-2.3: Redis 优先，不可用时自动回退 MemorySaver
         self.checkpointer = self._create_checkpointer()
         self.graph = self._build_graph()
         logger.info("Plan-Execute-Replan Service 初始化完成 (P1 enhanced)")
 
     @staticmethod
     def _create_checkpointer():
-        """创建 checkpointer，Redis 优先，不可用时回退 MemorySaver。
-
-        P1-2.3: 兼容 LangGraph 新旧版本 RedisSaver API。
+        """
+        创建 checkpointer，Redis 优先，不可用时回退 MemorySaver。
         """
         if config.redis_url:
             try:

@@ -103,13 +103,24 @@ ground_truth 拼接规则：
     - 如果原有问题的 Hit Rate 下降 > 5%，检查是否新文档干扰了检索排序
 """
 
+import random
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 # ---------------------------------------------------------------------------
 # 数据集版本号 — 修改测试集内容后递增
 # ---------------------------------------------------------------------------
-DATASET_VERSION = "1.2.0"
+DATASET_VERSION = "1.3.1"
+
+# ---------------------------------------------------------------------------
+# 数据集划分配置
+# ---------------------------------------------------------------------------
+DEFAULT_SPLIT_RATIOS = {
+    "train": 0.6,
+    "dev": 0.2,
+    "test": 0.2,
+}
+SPLIT_SEED = 42
 
 
 @dataclass
@@ -175,6 +186,142 @@ def validate_testset(samples: List[EvalSample]) -> List[str]:
     return errors
 
 
+def split_dataset(
+    samples: Optional[List[EvalSample]] = None,
+    ratios: Optional[Dict[str, float]] = None,
+    seed: int = SPLIT_SEED,
+    stratify_by: str = "category",
+) -> Tuple[List[EvalSample], List[EvalSample], List[EvalSample]]:
+    """将评估数据集划分为 train / dev / test 三组，支持分层采样。
+
+    划分策略：
+      - 按 category 分层，确保每个 split 中各类别比例与原始分布一致
+      - 使用固定随机种子（SPLIT_SEED=42），保证划分可复现
+      - 样本数不足时（如某个 category 仅 1 条），该样本优先放入 train
+
+    Args:
+        samples: 评估样本列表（默认：EVALUATION_DATASET）。
+        ratios: 划分比例（默认：train=0.6, dev=0.2, test=0.2）。
+        seed: 随机种子。
+        stratify_by: 分层字段名（默认按 category）。
+
+    Returns:
+        (train_set, dev_set, test_set) 三个 EvalSample 列表。
+
+    Example:
+        >>> train, dev, test = split_dataset()
+        >>> len(train), len(dev), len(test)
+        (28, 9, 10)
+        >>> # 消融实验使用 dev，最终报告使用 test
+    """
+    if samples is None:
+        samples = EVALUATION_DATASET
+    if ratios is None:
+        ratios = DEFAULT_SPLIT_RATIOS
+
+    total = len(samples)
+    if total < 5:
+        # 样本太少，不划分
+        return list(samples), [], []
+
+    rng = random.Random(seed)
+
+    # 按 stratify_by 分组
+    from collections import defaultdict
+
+    groups: Dict[str, List[EvalSample]] = defaultdict(list)
+    for s in samples:
+        key = getattr(s, stratify_by, "unknown")
+        groups[key].append(s)
+
+    train_set: List[EvalSample] = []
+    dev_set: List[EvalSample] = []
+    test_set: List[EvalSample] = []
+
+    for key, group in groups.items():
+        rng.shuffle(group)
+        n = len(group)
+
+        # 计算每组的 train/dev/test 数量，至少 train 分 1 条
+        n_train = max(1, round(n * ratios.get("train", 0.6)))
+        n_dev = max(0, round(n * ratios.get("dev", 0.2)))
+        n_test = n - n_train - n_dev
+        if n_test < 0:
+            n_dev = max(0, n - n_train)
+            n_test = 0
+
+        train_set.extend(group[:n_train])
+        dev_set.extend(group[n_train : n_train + n_dev])
+        test_set.extend(group[n_train + n_dev :])
+
+    # 各组内 shuffle 一次，打乱分组聚集
+    rng.shuffle(train_set)
+    rng.shuffle(dev_set)
+    rng.shuffle(test_set)
+
+    return train_set, dev_set, test_set
+
+
+def get_split_dataset(
+    split: str = "test",
+    samples: Optional[List[EvalSample]] = None,
+) -> "Dataset":
+    """获取指定划分的 HuggingFace Dataset。
+
+    Args:
+        split: "train" / "dev" / "test"。
+        samples: 可选，自定义样本列表（默认使用 EVALUATION_DATASET 并自动划分）。
+
+    Returns:
+        datasets.Dataset
+    """
+    train, dev, test = split_dataset(samples)
+    split_map = {"train": train, "dev": dev, "test": test}
+
+    if split not in split_map:
+        raise ValueError(f"split 必须是 'train'/'dev'/'test'，收到: {split}")
+
+    target = split_map[split]
+    if not target:
+        raise ValueError(f"split='{split}' 为空，请检查数据集大小和划分比例")
+
+    return _build_dataset_from_samples(target)
+
+
+def _build_dataset_from_samples(samples: List[EvalSample]) -> "Dataset":
+    """将 EvalSample 列表转换为 HuggingFace Dataset。"""
+    from datasets import Dataset
+
+    questions = []
+    ground_truths = []
+    categories = []
+    relevant_docs_list = []
+    gen_expected_facts_list = []
+    gen_forbidden_content_list = []
+    gen_min_length_list = []
+
+    for s in samples:
+        questions.append(s.question)
+        ground_truths.append("\n".join(s.ground_truths))
+        categories.append(s.category)
+        relevant_docs_list.append(s.relevant_docs)
+        gen_expected_facts_list.append(
+            s.gen_expected_facts if s.gen_expected_facts else s.ground_truths
+        )
+        gen_forbidden_content_list.append(s.gen_forbidden_content)
+        gen_min_length_list.append(s.gen_min_length)
+
+    return Dataset.from_dict({
+        "question": questions,
+        "ground_truth": ground_truths,
+        "category": categories,
+        "relevant_docs": relevant_docs_list,
+        "gen_expected_facts": gen_expected_facts_list,
+        "gen_forbidden_content": gen_forbidden_content_list,
+        "gen_min_length": gen_min_length_list,
+    })
+
+
 # ---------------------------------------------------------------------------
 # 评估数据集
 # ---------------------------------------------------------------------------
@@ -207,6 +354,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cpu_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            'CPU 飙高可能是由代码中的死循环或无限递归导致的，这是常见原因之一。',
+            '死循环导致的 CPU 飙高通常表现为某个线程的 CPU 使用率持续在 100% 左右。',
+            '可以使用 jstack 或 gdb 工具抓取线程堆栈来定位高 CPU 占用问题。',
+            '定位时需要分析处于 RUNNABLE 状态的线程以确认是否存在死循环。',
+        ],
     ),
     EvalSample(
         question="遇到CPU100%怎么紧急处理？限流还是扩容？",
@@ -217,6 +370,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cpu_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '流量突增导致 CPU100% 且影响核心链路时，若无法自动扩容应立即开启限流降级。',
+            '死循环导致 CPU100% 且影响核心链路时，应当立刻重启相关实例。',
+            '处理 CPU100% 紧急故障时，应同时申请紧急扩容以增加实例数。',
+            'CPU100% 紧急处理策略需根据原因是流量突增还是死循环来决定。',
+        ],
     ),
     EvalSample(
         question="数据库查询慢会拖慢应用服务器的CPU吗？",
@@ -242,6 +401,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cpu_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '应用日志中包含 ERROR 或 Exception 关键字通常表示存在报错信息。',
+            'OutOfMemoryError 是排查 CPU 问题时需要重点关注的内存相关异常类型。',
+            'TimeoutException 是排查 CPU 问题时需要重点关注的超时相关异常类型。',
+            '存在大量重复的错误日志是应用日志报错的重要特征之一。',
+        ],
     ),
 
     # ---------------------------------------------
@@ -271,6 +436,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["disk_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '正在被程序写入的日志文件不能直接使用 rm 命令删除，否则会导致磁盘空间无法立即释放。',
+            "清空正在写入的日志文件应使用重定向方式如 echo '' > file，以确保保留文件句柄不被释放。",
+            '历史旧日志文件可以直接删除，find 命令支持通过 -mtime 参数按修改时间筛选文件。',
+            '清理旧日志的典型策略是删除特定天数前的文件，例如超过 7 天的日志文件。',
+        ],
     ),
     EvalSample(
         question="磁盘高是不是因为 Docker 镜像太多？怎么清理？",
@@ -280,6 +451,13 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["disk_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            'Docker 镜像和无用容器的积累会占用大量磁盘空间。',
+            '清理操作主要针对的是 Docker 系统中的无用数据。',
+            'docker system prune -a --volumes 是清理 Docker 无用数据的命令。',
+            '该命令中的 --volumes 参数表示清理范围包含数据卷。',
+            '执行清理操作的前提是确认磁盘占用由 Docker 引起。',
+        ],
     ),
     EvalSample(
         question="磁盘告警紧急处理的30分钟内措施是什么？",
@@ -355,6 +533,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["memory_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '大文件处理会导致内存高，主要原因是一次性读取过大文件导致对象激增。',
+            '在内存中进行大批量的集合操作也是导致内存占用过高的原因之一。',
+            '流式处理或分页处理是优化大文件处理内存问题的可行方案。',
+        ],
     ),
     EvalSample(
         question="内存告警 5 分钟内我该做啥操作？",
@@ -365,6 +548,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["memory_high_usage.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '若内存告警影响核心链路，应当立刻隔离异常节点并摘除流量，以避免雪崩效应。',
+            '节点挂掉或重启前抓取现场是必要步骤，支持通过 jstat 或 OOM 时自动生成的 heap dump 实现。',
+            '针对严重内存泄漏且无法快速修复的场景，应采取执行应用重启的应对措施。',
+        ],
     ),
     EvalSample(
         question="怎么看 JVM 的内存使用详情？",
@@ -408,6 +596,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["service_unavailable.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '数据库连接问题是导致服务不可用的常见原因之一。',
+            '具体原因包括数据库连接失败、连接池满或数据库本身宕机。',
+            '数据库故障导致的服务不可用通常表现为大量请求阻塞。',
+            '应用日志中会出现 SQLTimeoutException 或 Connection refused 错误信息。',
+        ],
     ),
     EvalSample(
         question="出现服务不可用告警，1 分钟内必须要干嘛？",
@@ -418,6 +612,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["service_unavailable.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            '访问健康检查接口 (/health) 是确认服务不可用告警真实性的必要步骤。',
+            '存在备用集群或跨机房容灾时，流量切换是处理服务不可用的标准流程。',
+            '针对新版本发布导致的服务不可用，版本回滚是必须执行的恢复措施。',
+        ],
     ),
     EvalSample(
         question="怎么确认是不是外部依赖服务挂了导致的不可用？",
@@ -428,6 +627,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["service_unavailable.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '调用链监控或日志中出现大量外部依赖调用超时报错是服务异常的关键迹象。',
+            '熔断器组件如 Sentinel 或 Hystrix 触发熔断表明外部依赖服务可能已不可用。',
+            '外部依赖服务的端点连通性状态可以通过 curl 或 ping 命令进行测试验证。',
+        ],
     ),
     EvalSample(
         question="服务不可用事件结束后需要复盘吗？",
@@ -438,6 +642,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["service_unavailable.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            '服务不可用事件结束后必须进行复盘，这是故障恢复后的必要环节。',
+            '复盘会议需要在故障恢复后的 24 小时内组织相关人员开展。',
+            '复盘过程中需要分析根本原因并输出正式的故障报告。',
+            '必须制定改进项并录入系统进行跟踪解决，以实现问题闭环管理。',
+        ],
     ),
 
     # ---------------------------------------------
@@ -468,6 +678,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["slow_response.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            '缓存击穿会导致大量请求绕过缓存层直接访问数据库。',
+            '数据库负载急剧上升会导致整体接口响应时间显著变慢。',
+            '故障期间监控指标表现为缓存命中率出现断崖式下跌。',
+            '故障期间监控指标表现为数据库 QPS 出现异常突增。',
+        ],
     ),
     EvalSample(
         question="接口RT高，代码可能有啥问题？",
@@ -478,6 +694,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["slow_response.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '接口 RT 高可能是由于代码逻辑中存在复杂的循环计算导致处理耗时增加。',
+            '代码中执行频繁的同步 IO 操作，例如文件读写，会阻塞线程导致接口响应变慢。',
+            '在循环结构中调用外部 RPC 或查询数据库会引发 N+1 查询问题，从而增加接口 RT。',
+        ],
     ),
     EvalSample(
         question="响应慢的问题，30 分钟内怎么处理？",
@@ -488,6 +709,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["slow_response.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            '针对慢 SQL 导致的响应慢问题，紧急处理措施包括给涉及的表添加缺失的索引。',
+            '针对下游依赖慢且非核心链路问题，紧急措施包括开启降级开关或熔断弱依赖。',
+            '针对缓存失效导致的响应慢问题，紧急处理措施包括修复缓存逻辑并进行缓存预热。',
+        ],
     ),
     EvalSample(
         question="怎样预防接口变慢？",
@@ -498,6 +724,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["slow_response.md"],
         category="cross_doc",
+        gen_expected_facts=[
+            '预防接口变慢需要梳理所有外部依赖，并配置合理的超时时间和重试机制。',
+            '核心接口需要实施严格的限流和降级策略以防止性能下降。',
+            '所有上线的新 SQL 必须经过 DBA 审核，确保执行计划正确。',
+        ],
     ),
     EvalSample(
         question="CPU 和内存同时告警时，怎么判断是代码问题还是流量突增？",
@@ -596,6 +827,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["api_error_rate_spike.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'APIErrorRateSpike 告警触发条件是 API 5xx 错误率持续 3 分钟超过 5%。',
+            '该告警的级别被定义为紧急，表明需要高优先级处理。',
+            '触发该告警可能导致用户请求失败和业务中断等严重后果。',
+            'search_log 工具可用于查询日志以确认上游依赖、代码缺陷等故障原因。',
+        ],
     ),
     EvalSample(
         question="接口返回大量 5xx 错误怎么办？",
@@ -606,6 +843,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["api_error_rate_spike.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '处理 5xx 错误时，确定告警发生的时间范围是进行后续日志查询的必要前提。',
+            '搜索服务对应的日志主题是检查日志信息并进行问题排查的关键依据。',
+            '基于时间范围和查询条件检索日志是分析错误日志的基础。',
+        ],
     ),
     EvalSample(
         question="怎么处理 API 错误率突然升高的问题？",
@@ -616,6 +858,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["api_error_rate_spike.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '确定告警发生的时间范围需要通过获取当前时间来实现。',
+            'search_topic_by_service_name 工具的主要功能是搜索服务对应的日志主题。',
+            '错误日志分析依赖于按特定时间范围和查询条件检索到的日志数据。',
+            '检索和分析服务日志是定位 API 错误率突然升高原因的关键步骤。',
+        ],
     ),
     EvalSample(
         question="API 错误率从正常水平突然升高，一般要先怀疑哪些方向？",
@@ -628,6 +876,13 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["api_error_rate_spike.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '上游依赖故障是导致 API 错误率升高的方向之一，日志中会出现上游服务调用失败记录。',
+            '代码缺陷可能导致错误率升高，表现为特定代码路径频繁抛出异常。',
+            '配置错误是常见原因，通常伴随最近的配置变更或配置加载错误日志。',
+            '流量峰值引起请求量激增时，响应时间会变长，可能导致错误率升高。',
+            '网络问题如连接超时或服务无法访问也是导致 API 错误率升高的方向之一。',
+        ],
     ),
     EvalSample(
         question="API 5xx 持续升高时，日志里要重点看哪些信息？",
@@ -638,6 +893,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["api_error_rate_spike.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '排查 API 5xx 升高时需检索 api-gateway-logs 中 level 为 ERROR 或 status 为 5xx 的日志。',
+            '错误日志分析需提取错误类型、频率、请求路径、请求参数和错误堆栈等关键信息。',
+            '5xx 错误原因可能包括上游依赖故障、代码缺陷、配置错误、流量峰值或网络问题。',
+        ],
     ),
     EvalSample(
         question="CacheAvalanche 告警的触发条件是什么？",
@@ -649,6 +909,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cache_avalanche.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'CacheAvalanche 告警触发条件为缓存命中率骤降 30% 以上且数据库 QPS 飙升 3 倍。',
+            '触发原因通常是大量缓存 key 同时过期或热点 key 失效，导致请求穿透到数据库。',
+            '告警触发后数据库压力会剧增，这种情况可能引发服务雪崩。',
+            '缓存命中率日志和数据库 QPS 数据可通过 search_log 工具进行查询确认。',
+        ],
     ),
     EvalSample(
         question="缓存突然失效了怎么办？",
@@ -659,6 +925,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cache_avalanche.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '缓存失效后的恢复措施包括在系统重启后立即对热点数据进行预热。',
+            '优化缓存策略是防止缓存失效的重要手段，需设置合理的过期时间。',
+            '增加缓存容量或考虑扩容缓存是应对缓存失效问题的有效解决方案。',
+        ],
     ),
     EvalSample(
         question="怎么排查缓存雪崩问题？",
@@ -669,6 +940,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cache_avalanche.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '排查缓存雪崩问题时，必须确定告警发生的具体时间范围。',
+            'search_topic_by_service_name 工具可用于查询缓存服务日志主题。',
+            'search_log 工具可用于按时间检索缓存命中率日志。',
+            '获取当前时间是确定告警发生时间范围的基础步骤。',
+        ],
     ),
     EvalSample(
         question="缓存命中率低会影响什么？",
@@ -680,6 +957,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cache_avalanche.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '缓存命中率低会导致大量请求直达数据库，造成数据库压力剧增。',
+            '缓存未命中会增加请求处理耗时，导致整体服务响应变慢。',
+            '严重情况下，低缓存命中率可能引发连锁反应，导致系统雪崩效应。',
+            '服务响应延迟增加会直接导致最终用户的体验下降。',
+        ],
     ),
     EvalSample(
         question="网络链路抖动会不会让缓存表现得像失效了？",
@@ -690,6 +973,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["cache_avalanche.md", "network_high_latency.md"],
         category="edge_case",
+        gen_expected_facts=[
+            '网络链路抖动或故障可能导致应用无法连接到缓存服务器，使其表现为不可达。',
+            '较高的网络延迟会导致缓存请求超时，进而造成缓存命中率急剧下降。',
+            '排查时可在系统日志中发现网络连接超时或请求超时的错误记录。',
+            '网络问题引起的缓存访问异常在现象上与缓存服务本身失效非常相似。',
+        ],
     ),
     EvalSample(
         question="CertificateExpiry 告警的触发条件是什么？",
@@ -701,6 +990,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'CertificateExpiry 告警在 TLS 证书距离过期时间不足 7 天时触发。',
+            'CertificateExpiry 告警的严重级别被定义为紧急级别。',
+            '告警触发后会导致服务间 TLS 握手失败及用户浏览器显示安全警告。',
+            '解决该告警需要续签证书、更新服务器配置并重启相关服务。',
+        ],
     ),
     EvalSample(
         question="search_log 工具在查询系统日志时需要哪些参数？",
@@ -712,6 +1007,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'search_log 工具查询系统日志时，地域参数必须设置为 ap-guangzhou。',
+            '日志主题参数需要指定为 system-metrics 才能正确查询系统日志。',
+            'search_log 工具查询系统日志时，时间范围参数必须限定在最近 30 分钟内。',
+            '查询条件需包含 event:certificate_expiry 或 level:ERROR 的组合。',
+        ],
     ),
     EvalSample(
         question="SSL 证书快到期了怎么办？",
@@ -722,6 +1023,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md"],
         category="colloquial",
+        gen_expected_facts=[
+            "SSL 证书临近到期时，需要使用证书管理工具如 Let's Encrypt 进行续签操作。",
+            '新证书文件更新到服务器后，必须重启相关服务才能完成证书替换并生效。',
+            '建议设置证书到期前 30 天的提醒告警，以便预留充足时间处理证书续签。',
+            '定期检查证书有效期是防止 SSL 证书过期导致服务不可用的必要运维措施。',
+        ],
     ),
     EvalSample(
         question="网站访问时浏览器显示安全警告怎么处理？",
@@ -732,6 +1039,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '浏览器显示安全警告通常是由 TLS/SSL 证书即将过期或已过期引起的。',
+            '证书过期时必须立即续签证书并更新到服务器才能恢复访问。',
+            '新证书部署后的必要步骤是验证证书是否正确安装。',
+            'SSL 握手成功是确认证书安装有效且连接安全的技术指标。',
+        ],
     ),
     EvalSample(
         question="应用出现 SSL 握手失败怎么排查？",
@@ -742,6 +1055,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["certificate_expiry.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '系统日志和应用日志中包含证书有效期和状态的关键排查信息。',
+            '证书有效期过期或状态异常是导致 SSL 握手失败的常见原因。',
+            '证书路径和配置文件的正确性直接影响证书链的完整性。',
+            '证书过期后的标准处理流程是续签并更新到服务器。',
+        ],
     ),
     EvalSample(
         question="网络延迟高会影响 SSL 证书吗？",
@@ -768,6 +1087,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["container_oom_killed.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'ContainerOOMKilled 告警表示容器被 OOM Killer 终止，进程退出码为 137。',
+            '触发条件是 K8s Pod 内存使用量超出配置的 memory limit 限制。',
+            '告警触发后容器会重启，可能造成服务短暂不可用及数据丢失。',
+            '内存使用情况和 OOM 根因可通过 query_memory_metrics 及容器日志确认。',
+        ],
     ),
     EvalSample(
         question="query_memory_metrics 工具需要传哪些参数？",
@@ -778,6 +1103,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["container_oom_killed.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'query_memory_metrics 工具调用时必须指定地域参数，如 ap-guangzhou。',
+            '工具参数中需要包含时间范围，示例中要求为最近 30 分钟。',
+            '工具需要传入查询条件，例如内存使用率超过 90% 的阈值。',
+        ],
     ),
     EvalSample(
         question="如果容器突然挂了，怎么排查是不是因为内存问题？",
@@ -788,6 +1118,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["container_oom_killed.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '告警发生的时间范围是查询系统监控日志和容器日志的必要索引条件。',
+            '系统监控日志中内存使用率超过 90% 是确认容器是否因内存问题挂掉的关键指标。',
+            '容器日志中出现 level:ERROR、level:WARN 或 event:OOM 记录通常意味着发生了内存异常。',
+        ],
     ),
     EvalSample(
         question="应用突然崩溃了，怎么知道是不是内存不够用了？",
@@ -798,6 +1133,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["container_oom_killed.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '应用日志中出现 OutOfMemoryError 或 OOM 相关错误记录表明可能发生内存溢出。',
+            '内存使用趋势存在持续上升或突增现象是判断内存不足的重要依据。',
+            'query_memory_metrics 工具可用于查看内存使用趋势以确认是否存在异常增长。',
+            '应用进程退出码为 137 表示该进程被系统 OOM Killer 强制终止。',
+        ],
     ),
     EvalSample(
         question="数据库连接池耗尽会影响容器内存吗？",
@@ -824,6 +1165,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'DatabaseConnectionPoolExhaustion 告警在活跃连接数持续 5 分钟超过 90% 时触发。',
+            'DatabaseConnectionPoolExhaustion 告警的级别为严重。',
+            '告警触发后新请求无法获取数据库连接，导致请求超时增加。',
+            'search_log 工具可用于查询连接池日志，分析活跃连接数和等待队列长度。',
+        ],
     ),
     EvalSample(
         question="遇到数据库连接池耗尽怎么办？",
@@ -835,6 +1182,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '告警发生的具体时间范围是排查数据库连接池耗尽问题的关键信息。',
+            '系统日志和数据库连接池日志中包含连接池状态的关键数据。',
+            '应用日志和数据库性能指标是分析请求日志和性能问题的重要依据。',
+            '数据库连接池耗尽问题存在常见原因及对应的处理方案。',
+        ],
     ),
     EvalSample(
         question="数据库连接池满了怎么排查？",
@@ -846,6 +1199,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '排查数据库连接池问题时，需要获取当前时间并确定告警发生的具体时间范围。',
+            '系统日志可以通过 search_topic_by_service_name 方法进行查询和检索。',
+            '数据库连接池日志中包含连接池状态信息，检查该日志可确认连接池状态。',
+            '应用日志中包含请求量变化数据和错误堆栈信息，可用于分析故障原因。',
+        ],
     ),
     EvalSample(
         question="连接池满了会导致什么问题？",
@@ -857,6 +1216,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '连接池满载时，新的业务请求无法从池中获取到可用的数据库连接资源。',
+            '应用请求因等待连接资源而导致超时次数显著增加。',
+            '服务整体响应时间变慢，导致用户体验和系统性能下降。',
+            '严重情况下连接池耗尽可能引发级联故障，触发系统雪崩效应。',
+        ],
     ),
     EvalSample(
         question="网络延迟高会影响数据库连接池吗？",
@@ -867,6 +1232,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["database_connection_pool_exhaustion.md", "network_high_latency.md"],
         category="edge_case",
+        gen_expected_facts=[
+            '网络延迟高可能导致数据库连接不稳定，从而影响连接池。',
+            '高网络延迟引发的连接问题通常会在日志中体现为网络超时错误。',
+            '将数据库与应用部署在同一可用区可以减少网络跳数。',
+        ],
     ),
     EvalSample(
         question="消息积压了怎么办？",
@@ -877,6 +1247,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["message_queue_backlog.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '解决消息积压问题时，增加消费者实例数量可以提升消费端的并行处理能力。',
+            '启用生产者限流机制能够降低消息生产速率，防止积压情况进一步恶化。',
+            '优化消费者处理逻辑可以减少单条消息处理耗时，提高消费端的整体效率。',
+        ],
     ),
     EvalSample(
         question="怎么检查消息队列的日志？",
@@ -887,6 +1262,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["message_queue_backlog.md"],
         category="colloquial",
+        gen_expected_facts=[
+            'search_topic_by_service_name 工具支持根据服务名称查询消息队列的日志主题。',
+            'get_topic_info_by_name 工具用于获取指定日志主题的详细配置信息。',
+            'search_log 工具是检索消息队列相关日志内容的必要手段。',
+        ],
     ),
     EvalSample(
         question="消息队列积压后，如何分析消费者的CPU和内存使用情况？",
@@ -897,6 +1277,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["message_queue_backlog.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '需使用 query_cpu_metrics 和 query_memory_metrics 查询消费者资源。',
+            '查询工具的参数需包含消费者服务名及最近 1 小时的时间范围。',
+            'CPU 或内存使用率超过 80% 意味着消费者可能存在资源瓶颈。',
+            '资源瓶颈的解决措施通常包括服务扩容或代码优化。',
+        ],
     ),
     EvalSample(
         question="磁盘满了会影响消息队列吗？",
@@ -923,6 +1309,13 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["message_queue_backlog.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'MessageQueueBacklog 告警的级别被定义为严重级别，属于高优先级告警。',
+            '该告警适用的消息队列系统包括 Kafka 或 RocketMQ 两种中间件。',
+            '触发条件是消费延迟持续 10 分钟超过 10000 条消息积压。',
+            '消息积压会导致消费延迟增加以及整体业务处理延迟现象。',
+            '消息积压可能让下游服务响应变慢或出现请求失败的情况。',
+        ],
     ),
     EvalSample(
         question="证书快到期但还没过期时，会不会已经影响接口调用？",
@@ -950,6 +1343,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["network_high_latency.md"],
         category="exact_keyword",
+        gen_expected_facts=[
+            'NetworkHighLatency 告警触发条件是服务间网络延迟 P99 持续 5 分钟超过 500ms。',
+            'NetworkHighLatency 告警的告警级别配置为警告级别。',
+            '告警触发后可能导致服务间调用超时、请求堆积及用户体验下降。',
+            '可通过 search_log 查询延迟日志来确认受影响的服务对。',
+        ],
     ),
     EvalSample(
         question="网络延迟过高时，怎么判断是链路问题还是服务自身问题？",
@@ -961,6 +1360,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["network_high_latency.md"],
         category="colloquial",
+        gen_expected_facts=[
+            'network-metrics 日志主题记录了服务对延迟数据，可用于确认延迟最高的服务对。',
+            '应用日志中的 RPC 调用耗时记录能反映受影响的服务间调用情况。',
+            '服务器资源瓶颈是潜在原因之一，需通过 CPU 和内存指标进行排除。',
+            '跨地域链路的带宽和延迟状况需由网络团队进行检查确认。',
+        ],
     ),
     EvalSample(
         question="服务调用变慢了，怎么定位问题？",
@@ -971,6 +1376,11 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["network_high_latency.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '定位服务调用变慢问题时，首先需要确定告警发生的具体时间范围。',
+            'search_log 工具可用于查询系统日志和应用日志以分析网络延迟和错误记录。',
+            '服务器资源瓶颈可能导致服务变慢，可通过 query_cpu_metrics 和 query_memory_metrics 确认。',
+        ],
     ),
     EvalSample(
         question="网络延迟升高后，通常先拖慢哪些业务环节？",
@@ -981,6 +1391,12 @@ EVALUATION_DATASET: List[EvalSample] = [
         ],
         relevant_docs=["network_high_latency.md"],
         category="colloquial",
+        gen_expected_facts=[
+            '网络延迟升高会导致服务间调用耗时增加，可能引发调用超时。',
+            '网络延迟升高会造成请求在系统中堆积，无法及时得到处理。',
+            '请求处理变慢和堆积会直接导致最终用户体验下降。',
+            '网络延迟引发的连锁反应严重时可能触发系统的雪崩效应。',
+        ],
     ),
     EvalSample(
         question="数据库连接池耗尽会让外部请求的延迟表现出什么特征？",
@@ -996,6 +1412,520 @@ EVALUATION_DATASET: List[EvalSample] = [
             "大量阻塞线程可能占满应用线程池",
             "线程池满会导致新的网络请求无法被处理",
             "需通过应用日志确认连接等待时长",
+        ],
+    ),
+    # -----------------------------------------------------------------------
+    # Dataset v1.3.0 additions: cross-doc and edge-case focused samples
+    # -----------------------------------------------------------------------
+    EvalSample(
+        question="CPU 高、响应慢但错误率没明显上升时，怎么区分是流量峰值还是代码性能问题？",
+        ground_truths=[
+            "流量峰值通常表现为请求量明显增加、多个进程 CPU 均匀升高、响应时间变长但无明显错误。",
+            "代码性能问题通常表现为特定代码路径执行慢、日志中有性能警告或热点方法，但不一定伴随外部依赖异常。",
+            "如果是流量峰值，应优先扩容、限流并观察扩容后的 CPU 使用率。",
+            "如果是代码性能问题，应使用 APM、火焰图或日志定位慢方法，优化循环、递归和对象创建。",
+        ],
+        relevant_docs=["cpu_high_usage.md", "slow_response.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '流量峰值通常表现为请求量明显增加且多个进程 CPU 均匀升高。',
+            '流量峰值场景下响应时间变长，但错误率通常无明显上升。',
+            '代码性能问题通常表现为特定代码路径执行慢或日志中出现热点方法。',
+            '代码性能问题不一定伴随外部依赖异常，CPU 升高通常不如流量峰值均匀。',
+            'APM 和火焰图是定位代码性能问题中慢方法的有效工具。',
+        ],
+    ),
+    EvalSample(
+        question="缓存命中率突然下降后，为什么数据库连接池也可能被打满？",
+        ground_truths=[
+            "缓存失效或缓存穿透会导致数据库查询量激增，数据库 QPS 明显升高。",
+            "数据库访问增加会推高连接池活跃连接数，严重时新请求无法获取连接。",
+            "应同时关注缓存命中率、数据库 QPS、连接池活跃连接数和应用响应时间。",
+            "处理上需要预热热点缓存、优化缓存过期策略，并根据连接池压力调整限流或连接池配置。",
+        ],
+        relevant_docs=["cache_avalanche.md", "database_connection_pool_exhaustion.md", "slow_response.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '缓存失效或缓存穿透会导致数据库查询量激增，进而造成数据库 QPS 明显升高。',
+            '数据库访问增加会推高连接池活跃连接数，严重时导致新请求无法获取连接。',
+            '关联监控指标包含缓存命中率、数据库 QPS、连接池活跃连接数和应用响应时间。',
+            '该问题的处理策略涉及预热热点缓存、优化缓存过期策略，以及根据连接池压力调整限流配置。',
+        ],
+    ),
+    EvalSample(
+        question="消息队列积压同时消费者机器 CPU 和内存都高，应该怎样判断瓶颈？",
+        ground_truths=[
+            "消息积压可能来自消费者处理能力不足、生产者流量突增、消费者配置不当或系统资源不足。",
+            "CPU 或内存使用率高说明消费者实例可能存在资源瓶颈，会拖慢消费速度。",
+            "如果内存随运行时间持续上升且 Full GC 后无法释放，应考虑内存泄漏。",
+            "如果 CPU 均匀升高且请求或消息量同步增加，应优先考虑扩容消费者实例和调整消费者线程数。",
+        ],
+        relevant_docs=["message_queue_backlog.md", "cpu_high_usage.md", "memory_high_usage.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '消息积压可能源于消费者处理能力不足、生产者流量突增、消费者配置不当或系统资源不足。',
+            '消费者机器 CPU 或内存使用率高说明实例可能存在资源瓶颈，会拖慢消费速度。',
+            '若内存随运行时间持续上升且 Full GC 后无法释放，应考虑存在内存泄漏问题。',
+            'CPU 均匀升高且请求或消息量同步增加的现象，通常对应消费者实例不足或线程数配置不当的问题。',
+        ],
+    ),
+    EvalSample(
+        question="磁盘空间满会怎样把服务不可用和消息积压串起来？",
+        ground_truths=[
+            "磁盘空间满属于资源耗尽，可能导致服务无法写日志、写临时文件或正常启动，从而触发服务不可用。",
+            "消息队列 Broker 依赖磁盘存储消息，磁盘满或磁盘 IO 繁忙会导致消息写入失败或消费变慢。",
+            "服务不可用文档将磁盘空间满列为资源耗尽的一类，需要清理日志、临时文件或扩容资源。",
+            "消息积压场景下应关注 Broker 磁盘空间和 IO 状态，避免写入失败继续扩大影响。",
+        ],
+        relevant_docs=["disk_high_usage.md", "service_unavailable.md", "message_queue_backlog.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '磁盘空间满属于资源耗尽，会导致服务无法写日志、写临时文件或正常启动，从而触发服务不可用。',
+            '消息队列 Broker 依赖磁盘存储消息，磁盘满或磁盘 IO 繁忙会导致消息写入失败或消费变慢。',
+            '磁盘空间满作为资源耗尽的一种，是同时导致服务不可用和消息积压现象的共同潜在根因。',
+            '消息积压场景下写入失败会继续扩大影响，Broker 磁盘空间和 IO 状态是防止影响扩大的关键因素。',
+        ],
+    ),
+    EvalSample(
+        question="TLS 证书异常导致接口 5xx 增多时，应该从哪些证据判断是证书问题而不是普通网络抖动？",
+        ground_truths=[
+            "证书问题常见证据包括证书到期、证书链不完整、域名不匹配、证书被吊销或 SSL 握手失败日志。",
+            "API 错误率飙升时应分析错误类型、请求路径、错误频率和错误堆栈，确认是否集中在 TLS 握手或安全校验。",
+            "普通网络问题更常见连接超时、负载均衡异常或 DNS 解析失败等表现。",
+            "如果错误集中在 HTTPS 调用并伴随证书有效期或证书配置异常，应优先续签、更新证书并验证 SSL 握手。",
+        ],
+        relevant_docs=["certificate_expiry.md", "api_error_rate_spike.md", "network_high_latency.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '证书问题常见证据包括证书到期、证书链不完整、域名不匹配、证书被吊销或 SSL 握手失败日志。',
+            '证书问题引发的错误通常集中在 TLS 握手或安全校验环节，区别于普通业务逻辑错误。',
+            '普通网络问题更常见连接超时、负载均衡异常或 DNS 解析失败等表现，与证书错误特征不同。',
+            '错误集中在 HTTPS 调用并伴随证书有效期或配置异常时，是证书问题而非网络抖动的关键特征。',
+        ],
+    ),
+    EvalSample(
+        question="数据库慢查询为什么可能同时触发 CPU 高、响应慢和连接池耗尽？",
+        ground_truths=[
+            "数据库慢查询会让特定 SQL 执行时间变长，数据库 CPU 可能升高，连接池也会接近满载。",
+            "CPU 高文档指出数据库查询慢可能表现为应用 CPU 高、慢查询记录和连接池占用高。",
+            "响应慢文档将数据库慢查询列为常见原因，需找出最慢 SQL、检查索引并查看执行计划。",
+            "连接池耗尽会导致新请求无法获取连接，使请求超时增加并进一步拖慢服务响应。",
+        ],
+        relevant_docs=["database_connection_pool_exhaustion.md", "cpu_high_usage.md", "slow_response.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '数据库慢查询会导致特定 SQL 执行时间变长，进而引起数据库或应用 CPU 使用率升高。',
+            '慢查询导致数据库连接占用时间增加，使连接池占用接近满载甚至耗尽。',
+            '数据库慢查询被列为服务响应慢的常见原因之一，会直接增加请求处理时间。',
+            '连接池耗尽会导致新请求无法获取连接，使请求超时增加并进一步拖慢服务响应。',
+        ],
+    ),
+    EvalSample(
+        question="跨可用区网络延迟升高时，为什么数据库连接和 MQ 消费都会受影响？",
+        ground_truths=[
+            "跨地域或跨可用区网络延迟会让特定服务间调用耗时升高，并在应用日志中出现 RPC 超时。",
+            "数据库连接在跨可用区部署时会增加网络跳数，连接不稳定或超时可能加重连接池压力。",
+            "消息队列消费者若跨地域或连接远端 Broker，会因为拉取延迟和带宽限制导致消费速度下降。",
+            "优化方向包括就近部署数据库、消费者和 Broker，减少跨地域网络跳数并检查链路带宽。",
+        ],
+        relevant_docs=["network_high_latency.md", "database_connection_pool_exhaustion.md", "message_queue_backlog.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '跨地域或跨可用区网络延迟升高会导致服务间调用耗时增加，并在应用日志中出现 RPC 超时。',
+            '数据库连接跨可用区部署会增加网络跳数，连接不稳定或超时可能加重数据库连接池的压力。',
+            '消息队列消费者若连接远端 Broker，会因为拉取延迟和带宽限制导致消费速度下降。',
+            '跨地域网络跳数和链路带宽是影响数据库连接和消息队列消费性能的关键网络因素。',
+        ],
+    ),
+    EvalSample(
+        question="容器 OOM 之后服务短暂不可用，和普通内存高告警相比要关注哪些额外信息？",
+        ground_truths=[
+            "容器 OOMKilled 表示容器被 OOM Killer 终止，K8s Pod 可能因超出 memory limit 而重启。",
+            "普通内存高更强调内存泄漏、流量突增、缓存配置不当或 JVM 参数配置问题。",
+            "容器 OOM 需要关注容器日志、exit code 137、memory limit 和重启带来的服务短暂不可用。",
+            "两类场景都应在重启前尽量保留内存现场，并检查 GC、OOM 错误和内存使用趋势。",
+        ],
+        relevant_docs=["container_oom_killed.md", "memory_high_usage.md", "service_unavailable.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '容器 OOMKilled 表示容器因超出 memory limit 被终止，通常会导致 K8s Pod 重启。',
+            '普通内存高告警通常源于内存泄漏、流量突增、缓存配置不当或 JVM 参数配置问题。',
+            '容器 OOM 需额外关注 exit code 137、memory limit 配置及重启导致的服务短暂不可用。',
+            '两类场景均需检查 GC 日志、OOM 错误信息和内存使用趋势以辅助定位问题根因。',
+        ],
+    ),
+    EvalSample(
+        question="缓存雪崩后 API 错误率上升，什么时候应该先降级而不是只扩容？",
+        ground_truths=[
+            "缓存雪崩会让缓存命中率骤降、数据库 QPS 激增，并可能让应用响应时间变长。",
+            "API 错误率飙升如果来自上游依赖故障或数据库压力，应启用熔断、返回默认值或缓存数据。",
+            "只扩容应用实例不能直接解决数据库或缓存层被打穿的问题，可能继续放大下游压力。",
+            "应先通过限流、降级和缓存预热保护核心业务，再结合容量情况扩容缓存或应用实例。",
+        ],
+        relevant_docs=["cache_avalanche.md", "api_error_rate_spike.md", "slow_response.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '缓存雪崩会导致缓存命中率骤降和数据库 QPS 激增，从而引起应用响应时间变长。',
+            '仅扩容应用实例无法解决数据库或缓存层被打穿的问题，反而可能继续放大下游压力。',
+            'API 错误率飙升若来自上游依赖故障或数据库压力，属于需启用熔断或返回默认值的降级场景。',
+            '保护核心业务的正确顺序是先通过限流和降级，然后再结合容量情况扩容缓存或应用实例。',
+        ],
+    ),
+    EvalSample(
+        question="服务完全不可用但监控只看到高内存和磁盘满，先判断哪些资源耗尽路径？",
+        ground_truths=[
+            "服务不可用中的资源耗尽包括磁盘空间满、文件描述符耗尽、端口占用和内存不足导致 OOM。",
+            "内存高可能来自内存泄漏、流量突增、缓存配置不当、大文件处理或 JVM 参数不合理。",
+            "磁盘高可能来自日志文件过大、临时文件堆积、数据文件增长、备份文件或 Docker 资源占用。",
+            "应优先判断是否存在 OOM、磁盘无法写入或启动失败日志，并通过清理、扩容或重启恢复服务。",
+        ],
+        relevant_docs=["service_unavailable.md", "memory_high_usage.md", "disk_high_usage.md"],
+        category="cross_doc",
+        gen_expected_facts=[
+            '服务不可用中的资源耗尽包括磁盘空间满、文件描述符耗尽、端口占用和内存不足导致 OOM。',
+            '内存高可能来自内存泄漏、流量突增、缓存配置不当、大文件处理或 JVM 参数不合理。',
+            '磁盘高可能来自日志文件过大、临时文件堆积、数据文件增长、备份文件或 Docker 资源占用。',
+            'OOM、磁盘无法写入或启动失败日志是判断资源耗尽路径的关键指标。',
+        ],
+    ),
+    EvalSample(
+        question="CPU 已经恢复到 60% 以下，但响应时间还是高，可以说明 CPU 告警已经彻底解决了吗？",
+        ground_truths=[
+            "不能只凭 CPU 降到正常水平判断问题彻底解决，CPU 文档还要求检查应用响应时间是否恢复正常。",
+            "响应时间持续偏高可能来自数据库慢查询、外部 API 超时、缓存失效、系统资源不足或网络问题。",
+            "需要确认无新的错误日志产生，并持续观察至少 30 分钟确保问题不再复现。",
+            "如果响应慢仍存在，应继续沿慢查询、外部依赖、缓存命中率和网络延迟方向排查。",
+        ],
+        relevant_docs=["cpu_high_usage.md", "slow_response.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '仅凭 CPU 使用率恢复到 60% 以下不能判断告警解决，必须确认应用响应时间也恢复正常。',
+            '响应时间偏高可能源于数据库慢查询、外部 API 超时、缓存失效、系统资源不足或网络问题。',
+            '确认问题彻底解决需要无新的错误日志产生，并持续观察至少 30 分钟确保问题不再复现。',
+        ],
+    ),
+    EvalSample(
+        question="缓存命中率低但数据库 QPS 没升高，还能直接判定缓存雪崩吗？",
+        ground_truths=[
+            "不能直接判定缓存雪崩，因为缓存雪崩典型特征包括缓存命中率骤降和数据库 QPS 激增。",
+            "如果数据库 QPS 没升高，可能是流量较低、请求被限流、命中的是其他缓存层或业务路径没有访问数据库。",
+            "仍应检查缓存 miss 日志、热点 key 状态、缓存容量和过期策略是否异常。",
+            "判断缓存雪崩需要结合应用响应时间、数据库 QPS 和缓存命中率变化共同确认。",
+        ],
+        relevant_docs=["cache_avalanche.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '缓存雪崩的典型特征包括缓存命中率骤降和数据库 QPS 激增，二者需同时出现。',
+            '仅出现缓存命中率低但数据库 QPS 未升高时，不能直接判定为发生了缓存雪崩。',
+            '数据库 QPS 未升高可能由流量较低、请求被限流、命中其他缓存层或未访问数据库导致。',
+            '判断缓存雪崩需要结合应用响应时间、数据库 QPS 和缓存命中率变化共同确认。',
+        ],
+    ),
+    EvalSample(
+        question="证书还有 5 天才过期，但日志已经出现 SSL 握手失败，是否可以忽略到期告警？",
+        ground_truths=[
+            "不能忽略，因为证书到期未续只是证书异常的一类原因，证书链不完整、路径错误或域名不匹配也会导致握手失败。",
+            "证书配置错误可能表现为证书文件路径错误、证书链不完整或证书格式不正确。",
+            "证书不匹配会导致证书域名与实际访问域名不一致，并出现 SSL 握手失败。",
+            "应检查证书有效期、证书链、绑定域名和应用配置，并在修复后测试 SSL 握手是否成功。",
+        ],
+        relevant_docs=["certificate_expiry.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '不能忽略到期告警，因为证书到期未续只是导致 SSL 握手失败的其中一类原因。',
+            '证书链不完整、证书文件路径错误或域名不匹配同样会导致 SSL 握手失败。',
+            '证书配置错误可能表现为证书链不完整、证书文件路径错误或证书格式不正确。',
+            '证书域名与实际访问域名不一致会导致证书不匹配并引发 SSL 握手失败。',
+            '修复问题后需要测试 SSL 握手是否成功以验证配置的有效性。',
+        ],
+    ),
+    EvalSample(
+        question="Pod 被 OOMKilled 后自动重启成功，还需要继续分析吗？",
+        ground_truths=[
+            "需要继续分析，因为 OOMKilled 说明容器曾因内存限制被终止，可能造成服务短暂不可用或数据丢失。",
+            "应查看容器日志和系统监控日志，确认内存使用是否持续上升、突增或超过 memory limit。",
+            "如果是内存泄漏，应在重启前尽量保留堆转储或日志现场，定位大量对象引用的代码。",
+            "还应检查运行时内存参数和缓存配置，避免重启后再次 OOM。",
+        ],
+        relevant_docs=["container_oom_killed.md", "memory_high_usage.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            'OOMKilled 表明容器曾因内存限制被终止，可能造成服务不可用，需要继续分析。',
+            '容器日志和系统监控日志可反映内存使用是否持续上升、突增或超过 memory limit。',
+            '内存泄漏时，重启前保留堆转储或日志现场有助于定位大量对象引用的代码。',
+            '检查运行时内存参数和缓存配置有助于避免重启后再次发生 OOM。',
+        ],
+    ),
+    EvalSample(
+        question="消息积压下降到正常水平，但消费者仍有大量超时日志，这算恢复了吗？",
+        ground_truths=[
+            "不能算完全恢复，消息队列验证要求消费延迟降到正常水平，同时消费者处理速率恢复正常。",
+            "消费者处理超时或异常是消费者处理能力不足的典型特征，可能再次导致积压。",
+            "应继续检查消费者代码、线程数、批次大小和系统资源使用情况。",
+            "还需要观察应用日志无新的错误日志，并持续监控 30 分钟确保稳定。",
+        ],
+        relevant_docs=["message_queue_backlog.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '消息积压下降但消费者有超时日志不能算完全恢复，需同时满足消费延迟和处理速率正常。',
+            '消费者处理超时或异常是处理能力不足的典型特征，存在再次导致消息积压的风险。',
+            '消费者处理能力问题可能涉及代码逻辑、线程数、批次大小和系统资源使用情况。',
+            '系统恢复验证需要观察应用日志无新错误，并持续监控 30 分钟确保运行稳定。',
+        ],
+    ),
+    EvalSample(
+        question="网络 P99 延迟高，但 CPU 和内存都正常，能排除应用层问题吗？",
+        ground_truths=[
+            "不能完全排除应用层问题，网络延迟文档指出应用层协议问题也会造成连接超时或连接重置。",
+            "CPU 和内存正常更符合跨地域或跨可用区网络延迟的特征，但仍需查看应用日志中的 RPC 调用耗时。",
+            "应检查是否存在连接池大小或超时时间配置不合理、长耗时请求未异步处理、循环调用或 N+1 查询。",
+            "需要结合服务间调用日志和正常时段耗时对比，才能区分链路问题和应用层协议问题。",
+        ],
+        relevant_docs=["network_high_latency.md", "slow_response.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '不能完全排除应用层问题，应用层协议问题也会导致连接超时或重置。',
+            'CPU 和内存正常更符合跨地域或跨可用区网络延迟的特征。',
+            '连接池配置不合理、长耗时请求未异步处理或 N+1 查询可能引发延迟。',
+            '服务间调用日志和正常时段耗时对比可用于区分链路问题和应用层协议问题。',
+        ],
+    ),
+    EvalSample(
+        question="磁盘使用率高是备份文件导致的，可以只删除备份不改策略吗？",
+        ground_truths=[
+            "只删除备份只能短期释放空间，备份文件占用空间的根因还包括历史备份过多、未压缩和未转移到其他存储。",
+            "应优化备份策略，只保留最近 N 天备份、压缩备份文件，并将备份转移到对象存储或专用存储。",
+            "如果不调整策略，备份目录可能再次占满磁盘并触发告警。",
+            "删除前应确认备份保留要求，避免误删仍需保留的恢复点。",
+        ],
+        relevant_docs=["disk_high_usage.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '只删除备份文件只能短期释放空间，无法解决历史备份过多等根因。',
+            '如果不调整备份策略，备份目录可能再次占满磁盘并触发告警。',
+            '删除备份前应确认备份保留要求，避免误删仍需保留的恢复点。',
+            '备份策略优化包括保留最近 N 天备份、压缩文件及转移到对象存储。',
+        ],
+    ),
+    EvalSample(
+        question="API 5xx 只集中在一个请求路径，是不是一定说明上游依赖故障？",
+        ground_truths=[
+            "不一定，上游依赖故障确实可能表现为特定请求路径错误率高和上游调用失败。",
+            "代码缺陷也可能导致特定代码路径频繁抛出异常，错误堆栈会指向特定方法。",
+            "配置错误或网络问题也可能让某些路径集中失败，需要结合配置变更、连接超时和错误堆栈判断。",
+            "应从错误类型、错误频率、请求路径、请求参数和错误堆栈综合定位。",
+        ],
+        relevant_docs=["api_error_rate_spike.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            'API 5xx 集中在一个请求路径不一定说明是上游依赖故障，存在其他可能性。',
+            '代码缺陷也可能导致特定代码路径频繁抛出异常，错误堆栈会指向特定方法。',
+            '配置错误或网络问题也可能让某些路径集中失败，常伴随配置变更和连接超时现象。',
+            '问题定位依赖错误类型、错误频率、请求路径、请求参数和错误堆栈的综合信息。',
+        ],
+    ),
+    EvalSample(
+        question="连接池活跃连接数高但数据库 CPU 很低，是否还可能是数据库性能问题？",
+        ground_truths=[
+            "数据库性能问题通常伴随数据库 CPU 或内存使用率高、慢查询日志大量记录和连接池接近满载。",
+            "如果数据库 CPU 很低，应同时考虑连接泄漏、连接池配置不当或网络连接不稳定。",
+            "连接泄漏会表现为空闲连接数持续减少和大量连接超时记录。",
+            "配置不当可能是最大连接数过低或连接超时时间过短，需要验证连接池参数是否合理。",
+        ],
+        relevant_docs=["database_connection_pool_exhaustion.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '数据库性能问题通常伴随数据库 CPU 或内存使用率高、慢查询日志大量记录和连接池接近满载。',
+            '数据库 CPU 很低时，活跃连接数高可能由连接泄漏、连接池配置不当或网络连接不稳定引起。',
+            '连接泄漏会表现为空闲连接数持续减少和大量连接超时记录。',
+            '连接池配置不当可能是最大连接数过低或连接超时时间过短。',
+        ],
+    ),
+    EvalSample(
+        question="内存突然升高但 GC 能回收大部分内存，还需要按内存泄漏处理吗？",
+        ground_truths=[
+            "不应优先按内存泄漏处理，因为流量突增导致对象激增的特征包括内存突然升高且 GC 能回收大部分内存。",
+            "内存泄漏更典型的表现是内存持续缓慢上升、Full GC 后无法释放，并且运行时间越长占用越高。",
+            "这种情况应结合请求量或流量增长判断，优先考虑扩容、限流和优化缓存策略。",
+            "如果内存后续仍持续上升或出现 OOM，再进一步 dump 内存快照分析泄漏。",
+        ],
+        relevant_docs=["memory_high_usage.md"],
+        category="edge_case",
+        gen_expected_facts=[
+            '内存突然升高但 GC 能回收大部分内存是流量突增导致对象激增的特征，不应优先按内存泄漏处理。',
+            '内存泄漏的典型表现是内存持续缓慢上升，Full GC 后无法释放，且运行时间越长占用越高。',
+            '针对流量突增导致的内存升高，解决策略应优先考虑扩容、限流和优化缓存，而非内存泄漏排查。',
+            '只有当内存后续仍持续上升或出现 OOM 时，才需要进一步 dump 内存快照分析泄漏。',
+        ],
+    ),
+    EvalSample(
+        question="HighCPUUsage 告警里，死循环和流量突增的关键区别是什么？",
+        ground_truths=[
+            "死循环或无限递归通常表现为单个进程 CPU 占用接近 100%。",
+            "死循环场景下应用日志中可能出现大量重复的错误堆栈，内存使用也可能同步增长。",
+            "流量突增通常表现为多个进程 CPU 使用率均匀升高，请求量明显增加。",
+            "流量突增时响应时间会变长但可能没有明显错误，处理上优先扩容和限流。",
+        ],
+        relevant_docs=["cpu_high_usage.md"],
+        category="exact_keyword",
+        gen_expected_facts=[
+            '死循环或无限递归通常表现为单个进程 CPU 占用接近 100%。',
+            '死循环场景下应用日志中可能出现大量重复的错误堆栈，内存使用也可能同步增长。',
+            '流量突增通常表现为多个进程 CPU 使用率均匀升高，请求量明显增加。',
+            '流量突增时系统响应时间会变长，但可能没有明显错误日志产生。',
+        ],
+    ),
+    EvalSample(
+        question="SlowResponse 中外部 API 调用超时的处理方案有哪些？",
+        ground_truths=[
+            "应设置合理的 HTTP 客户端超时时间，避免无限等待，并分别设置连接超时和读取超时。",
+            "应实施降级策略，包括启用熔断、返回默认值或缓存数据。",
+            "非关键的外部调用可以改为异步处理，减少对主流程响应时间的影响。",
+            "还可以并行调用多个 API、使用批量接口减少调用次数，并增加本地缓存。",
+        ],
+        relevant_docs=["slow_response.md"],
+        category="exact_keyword",
+        gen_expected_facts=[
+            '应设置合理的 HTTP 客户端超时时间，包括连接超时和读取超时，避免无限等待。',
+            '应实施降级策略，包括启用熔断、返回默认值或使用缓存数据来保障服务可用性。',
+            '非关键的外部调用可以改为异步处理，以减少对主流程响应时间的影响。',
+            '可以通过并行调用多个 API 或使用批量接口来减少调用次数，并增加本地缓存。',
+        ],
+    ),
+    EvalSample(
+        question="DiskHighUsage 中 Docker 资源占用的典型表现和处理办法是什么？",
+        ground_truths=[
+            "Docker 资源占用通常表现为 Docker 占用大量磁盘空间、大量未使用镜像、停止容器未清理或容器日志过大。",
+            "处理时可以清理未使用镜像、停止的容器、未使用卷和所有未使用资源。",
+            "还应限制容器日志，配置日志驱动、限制日志文件大小并设置日志轮转。",
+            "长期应优化镜像，例如使用多阶段构建、减小镜像体积并定期清理旧镜像。",
+        ],
+        relevant_docs=["disk_high_usage.md"],
+        category="exact_keyword",
+        gen_expected_facts=[
+            'DiskHighUsage 中 Docker 资源占用典型表现为大量未使用镜像、停止容器未清理或容器日志过大。',
+            '处理办法包括清理未使用镜像、停止的容器、未使用卷和所有未使用资源。',
+            '应配置日志驱动、限制日志文件大小并设置日志轮转来控制容器日志大小。',
+            '长期优化可使用多阶段构建减小镜像体积，并定期清理旧镜像。',
+        ],
+    ),
+    EvalSample(
+        question="CacheAvalanche 里热点 key 失效应该怎么处理？",
+        ground_truths=[
+            "热点 key 失效通常表现为某个热点 key 突然失效、数据库特定查询激增、该 key 的 miss 日志大量出现。",
+            "可以临时增加该 key 的缓存时间，并手动刷新缓存。",
+            "应对热点 key 设置更长的过期时间，使用分布式锁防止并发更新。",
+            "还可以实现本地缓存作为后备，并考虑使用多级缓存。",
+        ],
+        relevant_docs=["cache_avalanche.md"],
+        category="exact_keyword",
+        gen_expected_facts=[
+            '热点 key 失效现象包括特定 key 突然失效、数据库查询激增及 miss 日志大量出现。',
+            '临时处理方案包括增加该 key 的缓存时间以及手动刷新缓存。',
+            '预防策略涉及设置更长的过期时间，并使用分布式锁防止并发更新。',
+            '架构层面可实现本地缓存作为后备，或采用多级缓存方案。',
+        ],
+    ),
+    EvalSample(
+        question="NetworkHighLatency 中 DNS 解析异常有哪些特征？",
+        ground_truths=[
+            "DNS 解析异常的特征包括 DNS 解析时间长、日志中有 DNS 解析失败记录。",
+            "该问题也可能表现为特定域名访问慢。",
+            "处理时需要检查 DNS 服务器配置是否正确，并检查 DNS 缓存设置是否合理。",
+            "优化方式包括配置多个 DNS 服务器作为备用，并在应用层增加 DNS 解析结果缓存。",
+        ],
+        relevant_docs=["network_high_latency.md"],
+        category="exact_keyword",
+        gen_expected_facts=[
+            'DNS 解析异常的特征之一包括 DNS 解析时间长。',
+            'DNS 解析异常的特征包括日志中有 DNS 解析失败记录。',
+            'DNS 解析异常也可能表现为特定域名访问速度慢。',
+            '处理该问题需要检查 DNS 服务器配置及缓存设置是否合理。',
+        ],
+    ),
+    EvalSample(
+        question="线上突然一堆 cache miss，数据库也变慢了，先怎么止血？",
+        ground_truths=[
+            "这种现象可能是缓存雪崩或缓存穿透，典型影响是缓存命中率下降、数据库查询量激增和响应时间变慢。",
+            "应先启用限流，保护数据库和核心业务不被进一步压垮。",
+            "应尽快预热热点数据、手动刷新缓存，并优化缓存过期时间。",
+            "如果错误率已经升高，应结合熔断或降级策略返回默认值或缓存数据。",
+        ],
+        relevant_docs=["cache_avalanche.md", "slow_response.md", "api_error_rate_spike.md"],
+        category="colloquial",
+        gen_expected_facts=[
+            '缓存雪崩或缓存穿透现象会导致缓存命中率下降、数据库查询量激增和响应时间变慢。',
+            '发生此类故障时应先启用限流，保护数据库和核心业务不被进一步压垮。',
+            '恢复阶段需预热热点数据、手动刷新缓存，并优化缓存过期时间。',
+            '错误率升高时应结合熔断或降级策略，返回默认值或缓存数据。',
+        ],
+    ),
+    EvalSample(
+        question="服务启动不了，日志里有配置加载错误，我该优先看什么？",
+        ground_truths=[
+            "配置错误的典型特征包括最近有配置变更、日志中有配置加载错误、环境变量缺失或启动参数错误。",
+            "应优先回滚到上一个正确配置，并检查配置文件语法和环境变量。",
+            "修复时需要对比正确配置文件，修正错误配置项并重新加载配置。",
+            "如果服务不可用，应在 5 分钟内快速判断能否修复，不能快速修复则执行回滚。",
+        ],
+        relevant_docs=["service_unavailable.md"],
+        category="colloquial",
+        gen_expected_facts=[
+            '配置错误的典型特征包括最近有配置变更、日志中有配置加载错误、环境变量缺失或启动参数错误。',
+            '配置加载错误的处理优先级是回滚到上一个正确配置，并检查配置文件语法和环境变量。',
+            '配置修复流程包括对比正确配置文件、修正错误配置项并重新加载配置。',
+            '服务不可用时应在 5 分钟内快速判断能否修复，不能快速修复则执行回滚。',
+        ],
+    ),
+    EvalSample(
+        question="消费者 lag 越来越大，但生产者只是正常发消息，可能是哪边的问题？",
+        ground_truths=[
+            "如果生产者没有明显流量突增，应优先怀疑消费者处理能力不足、消费者配置不当或系统资源不足。",
+            "消费者处理能力不足表现为实例数量不足、单个消费者处理速度慢、处理超时或异常。",
+            "消费者配置不当可能是线程数过少、批次大小不合理或消费者组配置不合理。",
+            "应检查消费者处理速率、CPU/内存使用率、线程数和批次大小，并按需扩容消费者实例。",
+        ],
+        relevant_docs=["message_queue_backlog.md"],
+        category="colloquial",
+        gen_expected_facts=[
+            '若生产者无流量突增，消费者 lag 增大通常源于消费者处理能力不足、配置不当或系统资源不足。',
+            '消费者处理能力不足表现为实例数量不足、单个处理速度慢、处理超时或出现异常。',
+            '消费者配置不当可能由线程数过少、批次大小不合理或消费者组配置不合理导致。',
+            '消费者处理速率下降或 CPU 内存使用率过高是系统资源不足或处理能力瓶颈的直接体现。',
+        ],
+    ),
+    EvalSample(
+        question="接口慢得离谱但没有报错，通常要看哪些方向？",
+        ground_truths=[
+            "响应慢但没有明显错误可能来自数据库慢查询、外部 API 调用超时、代码性能问题、缓存失效或系统资源不足。",
+            "数据库慢查询需要查看慢查询日志、数据库 CPU、连接池状态和 SQL 执行计划。",
+            "外部 API 或网络问题需要关注第三方调用记录、网络超时错误和下游服务响应情况。",
+            "系统资源不足时应检查 CPU、内存、磁盘 IO、网络带宽和系统负载。",
+        ],
+        relevant_docs=["slow_response.md", "database_connection_pool_exhaustion.md", "network_high_latency.md"],
+        category="colloquial",
+        gen_expected_facts=[
+            '接口响应慢但无报错通常由数据库慢查询、外部 API 调用超时、代码性能问题、缓存失效或系统资源不足导致。',
+            '数据库慢查询关联的关键指标包括慢查询日志、数据库 CPU、连接池状态和 SQL 执行计划。',
+            '外部 API 或网络问题涉及的关键信息包括第三方调用记录、网络超时错误和下游服务响应情况。',
+            '系统资源不足涉及的检查指标包括 CPU、内存、磁盘 IO、网络带宽和系统负载。',
+        ],
+    ),
+    EvalSample(
+        question="磁盘爆了以后，怎么快速判断是日志、临时文件还是 Docker 占用？",
+        ground_truths=[
+            "日志文件过大通常表现为 /var/log 占用大量空间、应用日志持续增长、没有日志轮转或日志级别为 DEBUG。",
+            "临时文件堆积通常表现为 /tmp 或文件上传临时目录占用大量空间，大量临时文件未清理。",
+            "Docker 占用通常表现为未使用镜像、停止容器、未使用卷或容器日志占用大量空间。",
+            "快速处理可查找最大文件和目录，并分别清理日志、临时文件或 Docker 未使用资源。",
+        ],
+        relevant_docs=["disk_high_usage.md"],
+        category="colloquial",
+        gen_expected_facts=[
+            '日志文件过大通常表现为/var/log 目录占用大量空间，应用日志持续增长且未配置日志轮转或级别为 DEBUG。',
+            '临时文件堆积通常表现为/tmp 或文件上传临时目录占用大量空间，存在大量未清理的临时文件。',
+            'Docker 占用通常由未使用镜像、停止容器、未使用卷或容器日志占用大量空间导致。',
+            '磁盘空间排查可通过查找最大文件和目录，区分日志、临时文件或 Docker 未使用资源。',
         ],
     ),
 ]

@@ -21,7 +21,9 @@ NC = \033[0m
         install install-dev dev run test test-quick format lint fix type-check \
         security pre-commit-install pre-commit check-all coverage docs shell \
         ipython watch add add-dev remove list-docs test-upload sync logs \
-        start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp
+        start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp \
+        docker-build docker-up docker-down docker-logs docker-status docker-push \
+        docker-push-versioned docker-shell
 
 # ============================================================
 # 默认目标：显示帮助信息
@@ -75,6 +77,16 @@ help:
 	@echo "  $(YELLOW)make fix$(NC)          - 🔧 自动修复问题"
 	@echo "  $(YELLOW)make test$(NC)         - 🧪 运行测试"
 	@echo "  $(YELLOW)make check-all$(NC)    - ✅ 运行所有检查"
+	@echo ""
+	@echo "$(CYAN)【RAG 评估】$(NC)"
+	@echo "  $(YELLOW)make eval-rag$(NC)            - 🧪 运行 RAG 检索评估"
+	@echo "  $(YELLOW)make eval-rag-full$(NC)       - 🧪 完整 RAG 评估（检索+生成）"
+	@echo "  $(YELLOW)make eval-generation$(NC)     - 🧪 生成质量独立评估"
+	@echo "  $(YELLOW)make eval-compare$(NC)        - 📊 对比 basic vs enhanced"
+	@echo "  $(YELLOW)make eval-ablation$(NC)       - 🔬 消融实验"
+	@echo "  $(YELLOW)make eval-validate-dataset$(NC) - 🔍 验证数据集质量"
+	@echo "  $(YELLOW)make eval-baseline-save$(NC)  - 📌 保存当前结果为基线"
+	@echo "  $(YELLOW)make eval-baseline-check$(NC) - 📊 与基线对比检查退化"
 	@echo ""
 	@echo "$(CYAN)【其他】$(NC)"
 	@echo "  $(YELLOW)make clean$(NC)        - 🧹 清理临时文件"
@@ -565,6 +577,89 @@ test-quick:  ## 快速测试
 	@echo "$(YELLOW)⚡ 快速测试...$(NC)"
 	python3 -m pytest tests/ -v
 
+# ============================================================
+# RAG 评估
+# ============================================================
+
+EVAL_RAG_MODE    ?= basic
+EVAL_OUTPUT_DIR  ?= reports
+
+eval-rag:  ## 运行 RAG 检索评估（用法: make eval-rag [EVAL_RAG_MODE=basic|enhanced]）
+	@echo "$(YELLOW)🧪 运行 RAG 检索评估 (mode=$(EVAL_RAG_MODE))...$(NC)"
+	RAG_MODE=$(EVAL_RAG_MODE) .venv/bin/python -m tests.evaluation.evaluate_rag --output $(EVAL_OUTPUT_DIR)/eval_$(EVAL_RAG_MODE)_latest.json
+
+eval-rag-full:  ## 运行完整 RAG 评估（检索 + 生成 + correctness）
+	@echo "$(YELLOW)🧪 运行完整 RAG 评估 (mode=$(EVAL_RAG_MODE), 含生成评估)...$(NC)"
+	RAG_MODE=$(EVAL_RAG_MODE) .venv/bin/python -m tests.evaluation.evaluate_rag \
+		--with-generation --generation-metrics full \
+		--output $(EVAL_OUTPUT_DIR)/eval_$(EVAL_RAG_MODE)_full_latest.json
+
+eval-generation:  ## 运行 RAG 生成质量独立评估
+	@echo "$(YELLOW)🧪 运行 RAG 生成质量评估 (mode=$(EVAL_RAG_MODE))...$(NC)"
+	RAG_MODE=$(EVAL_RAG_MODE) .venv/bin/python -m tests.evaluation.evaluate_generation \
+		--output $(EVAL_OUTPUT_DIR)/gen_$(EVAL_RAG_MODE)_latest.json
+
+eval-compare:  ## 对比 basic vs enhanced 模式评估结果
+	@echo "$(YELLOW)📊 对比 Basic vs Enhanced 评估结果...$(NC)"
+	.venv/bin/python -m tests.evaluation.compare_reports \
+		--basic $(EVAL_OUTPUT_DIR)/eval_basic_latest.json \
+		--enhanced $(EVAL_OUTPUT_DIR)/eval_enhanced_latest.json \
+		--output $(EVAL_OUTPUT_DIR)/comparison_latest.json
+
+eval-ablation:  ## 运行消融实验（跨参数组合）
+	@echo "$(YELLOW)🔬 运行消融实验...$(NC)"
+	.venv/bin/python -m tests.evaluation.run_ablation --output $(EVAL_OUTPUT_DIR)/ablation_latest.csv
+
+eval-validate-dataset:  ## 验证评估数据集质量
+	@echo "$(YELLOW)🔍 验证评估数据集质量...$(NC)"
+	.venv/bin/python -m tests.evaluation.validate_dataset
+
+eval-baseline-save:  ## 保存当前评估结果为基线
+	@echo "$(YELLOW)📌 保存评估基线 (mode=$(EVAL_RAG_MODE))...$(NC)"
+	@mkdir -p $(EVAL_OUTPUT_DIR)
+	RAG_MODE=$(EVAL_RAG_MODE) .venv/bin/python -m tests.evaluation.evaluate_rag \
+		--with-generation --generation-metrics full \
+		--output $(EVAL_OUTPUT_DIR)/baseline_$(EVAL_RAG_MODE).json
+	@echo "$(GREEN)✅ 基线已保存: $(EVAL_OUTPUT_DIR)/baseline_$(EVAL_RAG_MODE).json$(NC)"
+
+eval-baseline-check:  ## 与基线对比，检查指标退化
+	@echo "$(YELLOW)📊 与基线对比检查 (mode=$(EVAL_RAG_MODE))...$(NC)"
+	@if [ ! -f "$(EVAL_OUTPUT_DIR)/baseline_$(EVAL_RAG_MODE).json" ]; then \
+		echo "$(RED)❌ 基线文件不存在，请先运行: make eval-baseline-save$(NC)"; \
+		exit 1; \
+	fi
+	RAG_MODE=$(EVAL_RAG_MODE) .venv/bin/python -m tests.evaluation.evaluate_rag \
+		--with-generation --generation-metrics full \
+		--output $(EVAL_OUTPUT_DIR)/eval_$(EVAL_RAG_MODE)_check.json
+	.venv/bin/python -c "\
+import json, sys; \
+baseline = json.load(open('$(EVAL_OUTPUT_DIR)/baseline_$(EVAL_RAG_MODE).json')); \
+current = json.load(open('$(EVAL_OUTPUT_DIR)/eval_$(EVAL_RAG_MODE)_check.json')); \
+ret_b = baseline['retrieval_metrics']; \
+ret_c = current['retrieval_metrics']; \
+gen_b = baseline.get('generation_metrics') or {}; \
+gen_c = current.get('generation_metrics') or {}; \
+degraded = []; \
+DEGRADE_THRESHOLD = 0.05; \
+for m in ['context_precision','context_recall','context_relevancy','context_entity_recall']: \
+    if m in ret_b and m in ret_c and ret_c[m] is not None and ret_b[m] is not None: \
+        delta = ret_b[m] - ret_c[m]; \
+        if delta > DEGRADE_THRESHOLD: \
+            degraded.append(f'{m}: {ret_b[m]:.3f}→{ret_c[m]:.3f} (↓{delta:.3f})'); \
+for m in ['faithfulness','answer_relevancy','answer_correctness']: \
+    if m in gen_b and m in gen_c and gen_c[m] is not None and gen_b[m] is not None: \
+        delta = gen_b[m] - gen_c[m]; \
+        if delta > DEGRADE_THRESHOLD: \
+            degraded.append(f'{m}: {gen_b[m]:.3f}→{gen_c[m]:.3f} (↓{delta:.3f})'); \
+if degraded: \
+    print(f'⚠️  发现 {len(degraded)} 个指标退化（>{DEGRADE_THRESHOLD}）:'); \
+    for d in degraded: print(f'  - {d}'); \
+    sys.exit(1); \
+else: \
+    print('✅ 所有指标均未退化（退化阈值={DEGRADE_THRESHOLD}）'); \
+"
+	@echo "$(GREEN)✅ 基线对比检查完成$(NC)"
+
 check-all:  ## 运行所有检查
 	@echo "$(YELLOW)🚀 运行所有检查...$(NC)"
 	@$(MAKE) format
@@ -631,3 +726,63 @@ logs:  ## 查看服务日志
 		echo "$(RED)日志文件不存在$(NC)"; \
 		echo "$(YELLOW)提示: 使用 make start 启动服务后会生成日志$(NC)"; \
 	fi
+
+# ============================================================
+# Docker 管理（应用容器化）
+# ============================================================
+
+DOCKER_IMAGE   ?= oncall-mind
+DOCKER_TAG     ?= latest
+DOCKER_REPO    ?= blueblue22/oncall-mind
+ENV_FILE       ?= .env.docker
+
+docker-build:  ## 构建 Docker 镜像（精简版）
+	@echo "$(YELLOW)🐳 构建 Docker 镜像 $(DOCKER_IMAGE):$(DOCKER_TAG) ...$(NC)"
+	docker build -t $(DOCKER_IMAGE):$(DOCKER_TAG) .
+	@echo "$(GREEN)✅ 镜像构建完成: $(DOCKER_IMAGE):$(DOCKER_TAG)$(NC)"
+	@docker images $(DOCKER_IMAGE):$(DOCKER_TAG) --format "   大小: {{.Size}}"
+
+docker-up:  ## 一键启动所有服务（基础设施 + 应用）
+	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
+	@echo "$(GREEN)🚀 启动所有 Docker 服务$(NC)"
+	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
+	@echo ""
+	ENV_FILE=$(ENV_FILE) docker compose up -d
+	@echo ""
+	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
+	@echo "$(GREEN)✅ 所有服务已启动！$(NC)"
+	@echo "$(GREEN)═══════════════════════════════════════════════════════$(NC)"
+	@echo "   $(CYAN)FastAPI:$(NC)    http://localhost:9900"
+	@echo "   $(CYAN)API Docs:$(NC)   http://localhost:9900/docs"
+	@echo "   $(CYAN)Attu UI:$(NC)    http://localhost:8000"
+	@echo "   $(CYAN)Redis:$(NC)      localhost:6379"
+
+docker-down:  ## 停止所有 Docker 服务
+	@echo "$(YELLOW)🛑 停止所有 Docker 服务...$(NC)"
+	docker compose down
+	@echo "$(GREEN)✅ 所有服务已停止$(NC)"
+
+docker-logs:  ## 查看应用容器日志
+	docker compose logs -f oncall-mind
+
+docker-status:  ## 查看 Docker 服务状态
+	@echo "$(YELLOW)🔍 Docker 服务状态:$(NC)"
+	@docker compose ps
+
+docker-push:  ## 推送镜像到 Docker Hub
+	@echo "$(YELLOW)📤 推送镜像到 Docker Hub...$(NC)"
+	docker tag $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_REPO):$(DOCKER_TAG)
+	docker push $(DOCKER_REPO):$(DOCKER_TAG)
+	@echo "$(GREEN)✅ 已推送: $(DOCKER_REPO):$(DOCKER_TAG)$(NC)"
+
+docker-push-versioned:  ## 推送带版本号的镜像
+	@echo "$(YELLOW)📤 推送版本化镜像...$(NC)"
+	@VERSION=$$(grep 'version' pyproject.toml | head -1 | sed 's/.*"\(.*\)".*/\1/'); \
+	docker tag $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_REPO):v$$VERSION; \
+	docker tag $(DOCKER_IMAGE):$(DOCKER_TAG) $(DOCKER_REPO):v$$VERSION-lite; \
+	docker push $(DOCKER_REPO):v$$VERSION; \
+	docker push $(DOCKER_REPO):v$$VERSION-lite; \
+	echo "$(GREEN)✅ 已推送: $(DOCKER_REPO):v$$VERSION 和 v$$VERSION-lite$(NC)"
+
+docker-shell:  ## 进入应用容器 shell
+	docker exec -it oncall-mind bash

@@ -29,10 +29,6 @@ from app.core.llm_factory import create_chat_qwen_for_chat
 from app.services.trace_store import extract_token_usage, get_trace_store
 from app.tools import get_current_time, retrieve_knowledge
 
-# 阿里千问大模型和langchain集成参考： https://docs.langchain.com/oss/python/integrations/chat/qwen
-# 注意：需要配置环境变量 DASHSCOPE_API_BASE=https://dashscope.aliyuncs.com/compatible-mode/v1 否则默认访问的是新加坡站点
-# 同时也需要配置环境变量 DASHSCOPE_API_KEY=your_api_key
-
 
 class AgentState(TypedDict):
     """Agent 状态"""
@@ -41,7 +37,7 @@ class AgentState(TypedDict):
 
 def trim_messages_by_tokens(
     messages: Sequence[BaseMessage],
-    max_tokens: int = 8000,
+    max_tokens: int = 8000,  # 默认裁剪阈值为8000
     model_encoding: str = "cl100k_base",
 ) -> list[BaseMessage]:
     """按 token 数裁剪消息历史，保留首条 system message + 从新到旧裁剪到 max_tokens。
@@ -108,6 +104,7 @@ class RagAgentService:
         self.mcp_tools: list = []
 
         # 创建检查点（Redis 或内存，用于会话管理）
+        # 三层降级逻辑：Redis -> MemorySaver
         if config.redis_url:
             try:
                 from langgraph.checkpoint.base import BaseCheckpointSaver

@@ -1,0 +1,74 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# uv
+.uv/
+.uvignore
+uv.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+pyrightconfig.json
+
+# Environment (never bake secrets into image)
+.env
+.env.*
+!.env.example
+!.env.docker.example
+
+# Logs and runtime files
+*.log
+*.pid
+logs/
+server.log
+mcp_cls.log
+mcp_monitor.log
+
+# Milvus data volumes
+volumes/
+
+# Test and dev artifacts
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pre-commit-config.yaml
+
+# Reports and outputs
+reports/
+diagnosis_reports/
+agent_traces/
+
+# Uploads
+uploads/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (avoid recursive context)
+docker-compose*.yml
+vector-database.yml
+Dockerfile
+
+# Documentation (not needed at runtime)
+Project Docs/
+CLAUDE.md
+
+# Windows scripts
+start-windows.bat
+stop-windows.bat
