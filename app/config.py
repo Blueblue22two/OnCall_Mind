@@ -64,6 +64,7 @@ class Settings(BaseSettings):
     query_preprocessor_type: Literal["none", "rewrite"] = "none"
     reranker_type: Literal["none", "cross_encoder"] = "cross_encoder"
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_model_path: str = ""    # 本地模型路径，非空时优先从本地加载（跳过 HF 下载）
     reranker_top_k: int = 3          # enhanced 模式最终返回数（精排后截断）
     rerank_coarse_top_k: int = 10    # enhanced 模式粗排候选数（P0-1.3: 20→10 精排耗时减半）
     rag_diversify_by_file: bool = False  # 是否在 Enhanced 最终 Top-K 中优先覆盖不同来源文件

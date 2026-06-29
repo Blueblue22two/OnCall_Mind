@@ -316,6 +316,47 @@ uv pip install FlagEmbedding ragas datasets
 
 > 完整版镜像预计约 2.2 GB。
 
+### 下载 Reranker 模型（Enhanced RAG 必需）
+
+当使用 `RAG_MODE=enhanced` + `RERANKER_TYPE=cross_encoder` 时，系统需要加载 `BAAI/bge-reranker-v2-m3` 模型（约 560 MB）。模型首次使用时会自动从 HuggingFace 下载，但由于网络原因国内可能较慢或失败。推荐使用 ModelScope 预下载：
+
+**方法一：ModelScope CLI 下载（推荐）**
+
+```bash
+# 安装 ModelScope（如已安装可跳过）
+pip install modelscope
+
+# 下载模型到项目 models/ 目录
+modelscope download BAAI/bge-reranker-v2-m3 --local_dir ./models/BAAI/bge-reranker-v2-m3
+```
+
+下载完成后，在 `.env` 中将模型路径指向本地目录：
+
+```bash
+RERANKER_MODEL=./models/BAAI/bge-reranker-v2-m3
+```
+
+**方法二：Python 脚本下载**
+
+```python
+from modelscope import snapshot_download
+
+model_dir = snapshot_download("BAAI/bge-reranker-v2-m3", cache_dir="./models")
+print(f"模型已下载到: {model_dir}")
+```
+
+**方法三：sentence-transformers 自动下载**
+
+```bash
+# 设置 HuggingFace 镜像（可选，加速下载）
+export HF_ENDPOINT=https://hf-mirror.com
+
+# 首次运行时会自动下载到 ~/.cache/huggingface/hub/
+python -c "from sentence_transformers import CrossEncoder; CrossEncoder('BAAI/bge-reranker-v2-m3')"
+```
+
+> `models/` 目录已加入 `.gitignore`，模型文件不会被提交到代码仓库。
+
 
 ---
 

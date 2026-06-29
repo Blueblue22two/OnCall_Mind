@@ -32,6 +32,8 @@ Enhanced 模式目标：      context_precision ≥ 0.80, context_recall ≥ 0.8
 
 import argparse
 import asyncio
+import hashlib
+import importlib.metadata
 import json
 import math
 import random
@@ -210,30 +212,36 @@ def _retrieve_contexts(retriever, question: str, top_k: int = 3) -> list[str]:
 
 
 def _retrieve_docs(retriever, questions: list, top_k: int = 3):
-    """批量检索，返回上下文字符串和文档元数据（_file_name）
+    """批量检索，返回上下文字符串、文档元数据和检索诊断信息
 
     Returns:
-        tuple: (all_contexts: list[list[str]], all_file_names: list[list[str]])
+        tuple: (all_contexts: list[list[str]], all_file_names: list[list[str]],
+                all_diagnostics: list[dict])
     """
     all_contexts = []
     all_file_names = []
+    all_diagnostics = []
 
     for i, question in enumerate(questions, 1):
         try:
             docs = retriever.retrieve(question, top_k=top_k)
             contexts = [doc.page_content for doc in docs]
             file_names = [doc.metadata.get("_file_name", "") for doc in docs]
+            # 捕获检索诊断信息（P0-1）
+            diag = getattr(retriever, "last_retrieval_meta", {})
         except Exception as e:
             logger.error(f"检索失败: question='{question[:40]}', error={e}")
             contexts = []
             file_names = []
+            diag = {"error": str(e), "chunk_diagnostics": None}
 
         all_contexts.append(contexts if contexts else [""])
         all_file_names.append(file_names if file_names else [])
+        all_diagnostics.append(diag)
         if i % 10 == 0 or i == len(questions):
             logger.debug(f"[{i}/{len(questions)}] '{question[:40]}...' → {len(contexts) if contexts else 0} 段上下文")
 
-    return all_contexts, all_file_names
+    return all_contexts, all_file_names, all_diagnostics
 
 
 def _truncate_contexts(contexts_list: list[list[str]], top_k: int) -> list[list[str]]:
@@ -254,6 +262,7 @@ def _build_per_question_rows(
     contexts_list: list[list[str]],
     file_names_list: list[list[str]],
     relevant_docs_map: list[list[str]],
+    retrieval_diagnostics: list[dict] | None = None,
 ) -> list[dict]:
     """构建逐题明细骨架，后续再填充 RAGAS 分数和生成分数。"""
     per_question = []
@@ -261,6 +270,7 @@ def _build_per_question_rows(
         contexts = contexts_list[i]
         file_names = file_names_list[i] if i < len(file_names_list) else []
         relevant_docs = relevant_docs_map[i] if i < len(relevant_docs_map) else []
+        diag = retrieval_diagnostics[i] if retrieval_diagnostics and i < len(retrieval_diagnostics) else {}
         pq = {
             "index": i,
             "question": question,
@@ -269,9 +279,62 @@ def _build_per_question_rows(
             "retrieved_docs": file_names,
             "relevant_docs": relevant_docs,
             "hit": bool(set(file_names) & set(relevant_docs)),
+            "retrieval_diagnostics": diag.get("chunk_diagnostics"),  # P0-1: 分片级诊断
         }
         per_question.append(pq)
     return per_question
+
+
+class _JudgeCache:
+    """文件级 Judge LLM 响应缓存，避免重复实验时对相同 prompt 反复调用 API。
+
+    缓存 key 包含 Judge 模型、API 后端、温度、RAGAS 版本、指标 prompt
+    和完整消息，禁止不同 Judge 或评估版本之间交叉复用。
+    仅当 Judge temperature=0（确定性输出）时启用。
+    缓存文件存储在 reports/.judge_cache.json。
+    """
+
+    _CACHE_PATH = Path("reports/.judge_cache.json")
+
+    def __init__(self) -> None:
+        self._store: dict[str, Any] = {}
+        self._dirty = False
+        self._load()
+
+    def _load(self) -> None:
+        if self._CACHE_PATH.exists():
+            try:
+                self._store = json.loads(self._CACHE_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                self._store = {}
+
+    def _save(self) -> None:
+        if not self._dirty:
+            return
+        self._CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self._CACHE_PATH.write_text(
+            json.dumps(self._store, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        self._dirty = False
+
+    @staticmethod
+    def make_key(*parts: str) -> str:
+        raw = "||".join(parts)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+    def get(self, key: str) -> Any | None:
+        return self._store.get(key)
+
+    def set(self, key: str, value: Any) -> None:
+        self._store[key] = value
+        self._dirty = True
+
+    def persist(self) -> None:
+        self._save()
+
+
+# 模块级单例，跨问题共享缓存
+_JUDGE_CACHE = _JudgeCache()
 
 
 def _build_llm_wrapper(judge_timeout_s: int | None = None):
@@ -280,11 +343,16 @@ def _build_llm_wrapper(judge_timeout_s: int | None = None):
     Judge 使用独立的 eval_judge_* 配置，与线上 RAG 模型解耦，确保评估可复现。
     支持通过 eval_judge_api_base / eval_judge_api_key 指定外部 Judge API，
     为空时复用 DashScope 配置。
+
+    当 eval_judge_temperature=0 时启用 Judge 缓存，相同 prompt 不重复调用 API。
+    缓存命中时会记录 cache_hit 日志；评估结束后自动持久化到 reports/.judge_cache.json。
     """
     try:
         from ragas.llms import LangchainLLMWrapper
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from langchain_openai import ChatOpenAI
+        from langchain_core.language_models import BaseChatModel
+        from langchain_core.outputs import ChatResult
         from app.config import config
         from app.services.vector_embedding_service import vector_embedding_service
 
@@ -301,6 +369,117 @@ def _build_llm_wrapper(judge_timeout_s: int | None = None):
             timeout=timeout,
             max_retries=config.llm_max_retries,
         )
+
+        # 当 temperature=0 时，用文件缓存包裹 LLM，避免重复调用 API
+        use_cache = config.eval_judge_temperature == 0.0
+        if use_cache:
+            try:
+                ragas_version = importlib.metadata.version("ragas")
+            except importlib.metadata.PackageNotFoundError:
+                ragas_version = "unknown"
+            cache_namespace = json.dumps(
+                {
+                    "schema": 2,
+                    "model": config.eval_judge_model,
+                    "api_base": judge_api_base,
+                    "temperature": config.eval_judge_temperature,
+                    "ragas_version": ragas_version,
+                },
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+
+            class _CachedChatOpenAI(type(llm)):  # type: ignore[valid-type]
+                """透明缓存代理，拦截 generate() 调用并缓存 ChatResult。"""
+
+                def generate(
+                    self,
+                    messages,
+                    stop=None,
+                    callbacks=None,
+                    **kwargs,
+                ):
+                    # 构建缓存 key：基于 messages 内容 + stop 条件
+                    batches = messages if isinstance(messages, list) else [messages]
+                    normalized_messages = []
+                    for batch_index, batch in enumerate(batches):
+                        batch_messages = batch if isinstance(batch, list) else [batch]
+                        for message_index, message in enumerate(batch_messages):
+                            normalized_messages.append(
+                                {
+                                    "batch": batch_index,
+                                    "index": message_index,
+                                    "type": type(message).__name__,
+                                    "content": getattr(message, "content", ""),
+                                }
+                            )
+                    msg_repr = json.dumps(
+                        normalized_messages,
+                        sort_keys=True,
+                        ensure_ascii=False,
+                        default=str,
+                    )
+                    system_prompts = [
+                        item["content"]
+                        for item in normalized_messages
+                        if item["type"] in {"SystemMessage", "SystemMessagePromptTemplate"}
+                    ]
+                    metric_signature = hashlib.sha256(
+                        "||".join(map(str, system_prompts)).encode("utf-8")
+                    ).hexdigest()[:16]
+                    key = _JUDGE_CACHE.make_key(
+                        cache_namespace,
+                        metric_signature,
+                        msg_repr,
+                        str(stop or ""),
+                    )
+                    cached = _JUDGE_CACHE.get(key)
+                    if cached is not None:
+                        logger.debug(f"[JudgeCache] hit: {key}")
+                        # 反序列化为 ChatResult
+                        from langchain_core.outputs import ChatGeneration, ChatResult
+                        generations = []
+                        for g in cached.get("generations", []):
+                            msg_cls = type(
+                                "AIMessage", (),
+                                {"content": g["text"], "type": "ai"}
+                            )
+                            generations.append(
+                                ChatGeneration(text=g["text"], message=msg_cls())
+                            )
+                        return ChatResult(
+                            generations=generations,
+                            llm_output=cached.get("llm_output"),
+                        )
+
+                    # 调用原始 LLM
+                    result = super(  # type: ignore[misc]
+                        self.__class__.__mro__[1], self
+                    ).generate(messages, stop=stop, callbacks=callbacks, **kwargs)
+
+                    # 序列化并缓存
+                    serialized = {
+                        "generations": [
+                            {"text": g.text}
+                            for g in (result.generations if result.generations else [])
+                        ],
+                        "llm_output": result.llm_output,
+                    }
+                    _JUDGE_CACHE.set(key, serialized)
+                    logger.debug(f"[JudgeCache] miss: {key} → cached")
+                    return result
+
+            # 动态创建缓存子类实例
+            cached_llm = _CachedChatOpenAI(
+                model=config.eval_judge_model,
+                temperature=config.eval_judge_temperature,
+                api_key=judge_api_key,
+                base_url=judge_api_base,
+                timeout=timeout,
+                max_retries=config.llm_max_retries,
+            )
+            llm = cached_llm
+
         # RAGAS 0.4 marks LangChain wrappers as deprecated, but they remain the
         # safest bridge here because the project uses OpenAI-compatible Judge
         # config plus a custom DashScope embedding service.
@@ -317,6 +496,9 @@ def _build_llm_wrapper(judge_timeout_s: int | None = None):
             )
             ragas_llm = LangchainLLMWrapper(llm)
             ragas_embeddings = LangchainEmbeddingsWrapper(vector_embedding_service)
+
+        cache_msg = "（已启用 Judge 缓存）" if use_cache else ""
+        logger.info(f"Judge LLM 初始化完成: model={config.eval_judge_model}{cache_msg}")
         return ragas_llm, ragas_embeddings
 
     except ImportError as e:
@@ -437,8 +619,8 @@ def run_evaluation(
     generation_metrics_mode: str = "minimal",
     retrieval_metrics_mode: str = "minimal",
     ragas_timeout_s: int = 240,
-    ragas_max_workers: int = 4,
-    judge_timeout_s: int = 180,
+    ragas_max_workers: int = 8,
+    judge_timeout_s: int = 120,
     split: str = "all",
     sample_size: Optional[int] = None,
 ) -> dict:
@@ -572,7 +754,7 @@ def run_evaluation(
     logger.info("--- Phase 1: 检索评估 ---")
     non_llm_ks = (3, 5, 10)
     retrieval_pool_k = max(effective_top_k, max(non_llm_ks))
-    retrieval_pool_contexts, retrieval_pool_file_names = _retrieve_docs(
+    retrieval_pool_contexts, retrieval_pool_file_names, retrieval_diagnostics = _retrieve_docs(
         retriever,
         list(questions),
         top_k=retrieval_pool_k,
@@ -586,6 +768,7 @@ def run_evaluation(
         contexts_list=all_contexts,
         file_names_list=all_file_names,
         relevant_docs_map=relevant_docs_map,
+        retrieval_diagnostics=retrieval_diagnostics,
     )
 
     # 构建检索评估 Dataset
@@ -974,6 +1157,12 @@ def run_evaluation(
             json.dump(scores, f, ensure_ascii=False, indent=2)
         logger.info(f"JSON 结果已保存: {json_path}")
 
+    # 持久化 Judge 缓存，下次评测复用
+    _JUDGE_CACHE.persist()
+    cache_count = len(_JUDGE_CACHE._store)
+    if cache_count > 0:
+        logger.info(f"Judge 缓存已持久化: {cache_count} 条 → {_JUDGE_CACHE._CACHE_PATH}")
+
     if csv_path:
         _save_csv(scores, str(csv_path))
 
@@ -1030,16 +1219,16 @@ if __name__ == "__main__":
     parser.add_argument(
         "--ragas-max-workers",
         type=int,
-        default=4,
+        default=8,
         dest="ragas_max_workers",
-        help="RAGAS 并发 worker 数，调低可减少 Judge API 拥塞 (default: 4)",
+        help="RAGAS 并发 worker 数，调低可减少 Judge API 拥塞 (default: 8)",
     )
     parser.add_argument(
         "--judge-timeout",
         type=int,
-        default=180,
+        default=120,
         dest="judge_timeout_s",
-        help="Judge LLM 单请求超时秒数 (default: 180)",
+        help="Judge LLM 单请求超时秒数 (default: 120)",
     )
     parser.add_argument(
         "--split",

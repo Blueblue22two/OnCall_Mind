@@ -22,9 +22,10 @@
   - 混合检索失败 → 抛出异常（基础设施问题不应静默降级）
 """
 
+import statistics
 import time
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from langchain_core.documents import Document
 from loguru import logger
@@ -110,6 +111,92 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             selected.append(doc)
 
         return selected[:top_k]
+
+    @staticmethod
+    def _build_chunk_diagnostics(
+        reranker: Any,
+        rerank_source: str,
+        candidates: list[Document],
+        final_docs: list[Document],
+        top_k: int,
+        diversify_by_file: bool,
+    ) -> Dict[str, Any]:
+        """构建分片级诊断信息，用于定位精排、分块或截断环节的瓶颈。
+
+        记录了候选池中每个分片的分数、元数据、是否被选中及截断原因。
+        """
+        Content_PREVIEW_LEN = 120
+
+        # CrossEncoder.last_scores 已按得分降序；透传/降级时保持粗排顺序。
+        ranked_candidates: list[Document] = list(candidates)
+        rerank_scores: Dict[int, float] = {}
+        if hasattr(reranker, "last_scores") and reranker.last_scores:
+            for score, doc in reranker.last_scores:
+                rerank_scores[id(doc)] = float(score)
+            ranked_candidates = [doc for _, doc in reranker.last_scores]
+
+        chunk_entries: list[Dict[str, Any]] = []
+
+        # 标记最终选中的文档 ID
+        final_ids: set[int] = {id(doc) for doc in final_docs}
+
+        # 确定截断原因
+        def _truncation_reason(doc: Document, rank: int, selected: bool) -> Optional[str]:
+            if selected:
+                return None
+            if diversify_by_file and rank <= top_k:
+                return "diversity_skip"
+            return "below_top_k"
+
+        for rank, doc in enumerate(ranked_candidates, 1):
+            metadata = doc.metadata or {}
+            score = rerank_scores.get(id(doc))
+            selected = id(doc) in final_ids
+
+            entry: Dict[str, Any] = {
+                "rank": rank,
+                "score": round(score, 6) if score is not None else None,
+                "selected": selected,  # backward-compatible alias
+                "selected_in_pool": selected,
+                "selected_in_context": False,  # evaluation layer fills this
+                "truncation_reason": _truncation_reason(doc, rank, selected),
+                "file_name": metadata.get("_file_name", metadata.get("_source", "")),
+                "source": metadata.get("_source", ""),
+                "h1": metadata.get("h1", "") or "",
+                "h2": metadata.get("h2", "") or "",
+                "h3": metadata.get("h3", "") or "",
+                "content_preview": doc.page_content[:Content_PREVIEW_LEN].replace("\n", " "),
+            }
+            chunk_entries.append(entry)
+
+        # 汇总统计
+        valid_scores = [e["score"] for e in chunk_entries if e["score"] is not None]
+        score_range: Optional[Dict[str, float]] = None
+        if valid_scores:
+            score_range = {
+                "min": round(min(valid_scores), 6),
+                "max": round(max(valid_scores), 6),
+                "mean": round(statistics.mean(valid_scores), 6),
+                "n": len(valid_scores),
+            }
+
+        selected_count = sum(1 for e in chunk_entries if e["selected"])
+        diversity_skipped = sum(
+            1 for e in chunk_entries if e.get("truncation_reason") == "diversity_skip"
+        )
+        below_top_k_count = sum(
+            1 for e in chunk_entries if e.get("truncation_reason") == "below_top_k"
+        )
+
+        return {
+            "rerank_source": rerank_source,
+            "total_candidates": len(candidates),
+            "final_selected": selected_count,
+            "dropped_below_top_k": below_top_k_count,
+            "dropped_by_diversity": diversity_skipped,
+            "score_range": score_range,
+            "chunks": chunk_entries,
+        }
 
     def retrieve(self, query: str, top_k: int, debug: bool = False) -> list[Document]:
         """执行完整增强检索 pipeline
@@ -226,8 +313,9 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             rerank_pool_k = min(len(candidates), max(top_k, top_k * multiplier))
         meta["rerank_pool_k"] = rerank_pool_k
 
+        rerank_source: str = config.reranker_type  # 实际使用的精排来源
+        reranker = get_reranker(config.reranker_type, config.reranker_model)
         try:
-            reranker = get_reranker(config.reranker_type, config.reranker_model)
             reranked_docs = reranker.rerank(
                 query=original_query,
                 documents=candidates,
@@ -246,6 +334,7 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
                 final_docs = self._diversify_by_file(fallback_docs, top_k=top_k)
             else:
                 final_docs = fallback_docs[:top_k]
+            rerank_source = "coarse_truncation"
             if meta["degraded_stage"] is None:
                 meta["degraded_stage"] = "reranker"
             else:
@@ -256,6 +345,21 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         meta["final_count"] = len(final_docs)
         meta["reranker_time_ms"] = int((time.time() - t_stage3) * 1000)
         meta["total_time_ms"] = int((time.time() - t_start) * 1000)
+
+        # ----------------------------------------------------------------
+        # Step 3b: 构建分片级诊断信息（P0-1）
+        # ----------------------------------------------------------------
+        chunk_diagnostics = self._build_chunk_diagnostics(
+            reranker=reranker,
+            rerank_source=rerank_source,
+            candidates=candidates,
+            final_docs=final_docs,
+            top_k=top_k,
+            diversify_by_file=config.rag_diversify_by_file,
+        )
+        meta["chunk_diagnostics"] = chunk_diagnostics
+        meta["rerank_source"] = rerank_source
+
         self.last_retrieval_meta = meta
 
         # ----------------------------------------------------------------
