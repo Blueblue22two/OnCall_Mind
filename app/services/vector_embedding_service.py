@@ -22,6 +22,7 @@ class DashScopeEmbeddings(Embeddings):
         api_key: str,
         model: str = "text-embedding-v4",
         dimensions: int = 1024,
+        batch_size: int = 10,
     ):
         """
         初始化 DashScope Embeddings
@@ -30,6 +31,7 @@ class DashScopeEmbeddings(Embeddings):
             api_key: DashScope API Key
             model: 嵌入模型名称
             dimensions: 向量维度
+            batch_size: 单次 API 请求的最大文本数（DashScope v4 上限为 10）
         """
         if not api_key or api_key == "your-api-key-here":
             raise ValueError("请设置环境变量 DASHSCOPE_API_KEY")
@@ -40,6 +42,9 @@ class DashScopeEmbeddings(Embeddings):
         )
         self.model = model
         self.dimensions = dimensions
+        if batch_size < 1 or batch_size > 10:
+            raise ValueError("embedding batch_size 必须在 1~10 之间")
+        self.batch_size = batch_size
         
         # 打印初始化信息
         masked_key = self._mask_api_key(api_key)
@@ -71,15 +76,31 @@ class DashScopeEmbeddings(Embeddings):
         try:
             logger.info(f"批量嵌入 {len(texts)} 个文档")
             
-            # 批量调用 API
-            response = self.client.embeddings.create(
-                model=self.model,
-                input=texts,
-                dimensions=self.dimensions,
-                encoding_format="float"
-            )
-            
-            embeddings = [item.embedding for item in response.data]
+            embeddings: List[List[float]] = []
+            total_batches = (len(texts) + self.batch_size - 1) // self.batch_size
+            for batch_number, start in enumerate(
+                range(0, len(texts), self.batch_size), 1
+            ):
+                batch = texts[start : start + self.batch_size]
+                logger.debug(
+                    f"Embedding 批次 {batch_number}/{total_batches}, size={len(batch)}"
+                )
+                response = self.client.embeddings.create(
+                    model=self.model,
+                    input=batch,
+                    dimensions=self.dimensions,
+                    encoding_format="float",
+                )
+                ordered = sorted(
+                    response.data,
+                    key=lambda item: getattr(item, "index", 0),
+                )
+                if len(ordered) != len(batch):
+                    raise RuntimeError(
+                        f"Embedding 返回数量异常: expected={len(batch)}, actual={len(ordered)}"
+                    )
+                embeddings.extend(item.embedding for item in ordered)
+
             logger.debug(f"批量嵌入完成, 维度: {len(embeddings[0])}")
             
             return embeddings
@@ -125,5 +146,6 @@ class DashScopeEmbeddings(Embeddings):
 vector_embedding_service = DashScopeEmbeddings(
     api_key=config.dashscope_api_key,
     model=config.dashscope_embedding_model,
-    dimensions=1024
+    dimensions=1024,
+    batch_size=config.embedding_batch_size,
 )

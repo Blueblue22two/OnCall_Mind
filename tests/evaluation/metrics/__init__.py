@@ -12,6 +12,12 @@
 
 from tests.evaluation.metrics.hit_rate import compute_hit_rate, compute_hit_rate_multi_k
 from tests.evaluation.metrics.mrr import compute_mrr
+from tests.evaluation.metrics.retrieval_coverage import (
+    all_relevant_hit_at_k,
+    document_coverage_at_k,
+    ndcg_at_k,
+    section_hit_at_k,
+)
 from tests.evaluation.metrics.tool_call_accuracy import compute_tool_call_accuracy
 from tests.evaluation.metrics.goal_accuracy import build_goal_accuracy_prompt, compute_goal_accuracy
 from tests.evaluation.metrics.answer_completeness import (
@@ -31,6 +37,10 @@ __all__ = [
     "compute_hit_rate",
     "compute_hit_rate_multi_k",
     "compute_mrr",
+    "document_coverage_at_k",
+    "all_relevant_hit_at_k",
+    "section_hit_at_k",
+    "ndcg_at_k",
     "compute_tool_call_accuracy",
     "build_goal_accuracy_prompt",
     "compute_goal_accuracy",

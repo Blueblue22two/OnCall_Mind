@@ -11,7 +11,7 @@
   RERANKER_TYPE=cross_encoder \\
   python -m tests.evaluation.evaluate_rag
 
-  # 包含生成评估（faithfulness + answer_relevancy，需 Agent 生成 answer）
+  # 包含生成评估（faithfulness + answer_relevancy，模型基于已检索 contexts 生成 answer）
   RAG_MODE=basic python -m tests.evaluation.evaluate_rag --with-generation
 
   # 完整生成评估（含 answer_correctness）
@@ -32,18 +32,70 @@ Enhanced 模式目标：      context_precision ≥ 0.80, context_recall ≥ 0.8
 
 import argparse
 import asyncio
-import hashlib
 import importlib.metadata
 import json
 import math
 import random
 import sys
+import subprocess
 import warnings
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
 from loguru import logger
+
+
+def _git_revision() -> str:
+    """Return the current commit hash without failing outside a Git checkout."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _judge_cache_namespace(
+    model: str,
+    api_base: str,
+    temperature: float,
+    ragas_version: str,
+) -> str:
+    """Build a stable cache namespace for one Judge configuration."""
+    return json.dumps(
+        {
+            "schema": 2,
+            "model": model,
+            "api_base": api_base,
+            "temperature": temperature,
+            "ragas_version": ragas_version,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+
+
+def _judge_metric_name(prompt: str) -> str:
+    """Extract the RAGAS metric family so it is explicit in every cache key."""
+    normalized = prompt.lower().replace("_", " ")
+    aliases = (
+        ("context entity recall", "context_entity_recall"),
+        ("context precision", "context_precision"),
+        ("context recall", "context_recall"),
+        ("context relevance", "context_relevancy"),
+        ("faithfulness", "faithfulness"),
+        ("answer relevancy", "answer_relevancy"),
+        ("answer correctness", "answer_correctness"),
+    )
+    for marker, name in aliases:
+        if marker in normalized:
+            return name
+    return "unknown_metric"
 
 
 def _bootstrap_confidence_interval(
@@ -143,22 +195,26 @@ def _coerce_metric_score(
     """
     if isinstance(value, (list, tuple)):
         scores = []
+        aligned_scores: list[float | None] = []
         skipped = 0
         for item in value:
             try:
                 score = float(item)
             except (TypeError, ValueError):
                 skipped += 1
+                aligned_scores.append(None)
                 continue
             if math.isfinite(score):
                 scores.append(score)
+                aligned_scores.append(score)
             else:
                 skipped += 1
+                aligned_scores.append(None)
 
         if not scores:
             logger.warning(f"{metric_name} 没有可用分数，返回 0.0")
             if return_per_sample:
-                return 0.0, []
+                return 0.0, aligned_scores
             return 0.0
 
         if skipped:
@@ -168,7 +224,7 @@ def _coerce_metric_score(
             )
         agg = round(sum(scores) / len(scores), 4)
         if return_per_sample:
-            return agg, scores
+            return agg, aligned_scores
         return agg
 
     try:
@@ -220,6 +276,7 @@ def _retrieve_docs(retriever, questions: list, top_k: int = 3):
     """
     all_contexts = []
     all_file_names = []
+    all_section_ids = []
     all_diagnostics = []
 
     for i, question in enumerate(questions, 1):
@@ -227,21 +284,27 @@ def _retrieve_docs(retriever, questions: list, top_k: int = 3):
             docs = retriever.retrieve(question, top_k=top_k)
             contexts = [doc.page_content for doc in docs]
             file_names = [doc.metadata.get("_file_name", "") for doc in docs]
+            section_ids = [
+                f"{doc.metadata.get('_file_name', '')}::{doc.metadata.get('h2', '')}"
+                for doc in docs
+            ]
             # 捕获检索诊断信息（P0-1）
             diag = getattr(retriever, "last_retrieval_meta", {})
         except Exception as e:
             logger.error(f"检索失败: question='{question[:40]}', error={e}")
             contexts = []
             file_names = []
+            section_ids = []
             diag = {"error": str(e), "chunk_diagnostics": None}
 
         all_contexts.append(contexts if contexts else [""])
         all_file_names.append(file_names if file_names else [])
+        all_section_ids.append(section_ids if section_ids else [])
         all_diagnostics.append(diag)
         if i % 10 == 0 or i == len(questions):
             logger.debug(f"[{i}/{len(questions)}] '{question[:40]}...' → {len(contexts) if contexts else 0} 段上下文")
 
-    return all_contexts, all_file_names, all_diagnostics
+    return all_contexts, all_file_names, all_section_ids, all_diagnostics
 
 
 def _truncate_contexts(contexts_list: list[list[str]], top_k: int) -> list[list[str]]:
@@ -262,6 +325,8 @@ def _build_per_question_rows(
     contexts_list: list[list[str]],
     file_names_list: list[list[str]],
     relevant_docs_map: list[list[str]],
+    section_ids_list: list[list[str]] | None = None,
+    relevant_sections_map: list[list[str]] | None = None,
     retrieval_diagnostics: list[dict] | None = None,
 ) -> list[dict]:
     """构建逐题明细骨架，后续再填充 RAGAS 分数和生成分数。"""
@@ -270,7 +335,20 @@ def _build_per_question_rows(
         contexts = contexts_list[i]
         file_names = file_names_list[i] if i < len(file_names_list) else []
         relevant_docs = relevant_docs_map[i] if i < len(relevant_docs_map) else []
+        sections = section_ids_list[i] if section_ids_list and i < len(section_ids_list) else []
+        relevant_sections = (
+            relevant_sections_map[i]
+            if relevant_sections_map and i < len(relevant_sections_map)
+            else []
+        )
         diag = retrieval_diagnostics[i] if retrieval_diagnostics and i < len(retrieval_diagnostics) else {}
+        chunk_diagnostics = deepcopy(diag.get("chunk_diagnostics"))
+        if chunk_diagnostics:
+            for chunk in chunk_diagnostics.get("chunks", []):
+                output_rank = chunk.get("output_rank")
+                chunk["selected_in_context"] = bool(
+                    output_rank and output_rank <= len(contexts)
+                )
         pq = {
             "index": i,
             "question": question,
@@ -278,63 +356,23 @@ def _build_per_question_rows(
             "contexts_count": len(contexts) if contexts != [""] else 0,
             "retrieved_docs": file_names,
             "relevant_docs": relevant_docs,
+            "retrieved_sections": sections,
+            "relevant_sections": relevant_sections,
             "hit": bool(set(file_names) & set(relevant_docs)),
-            "retrieval_diagnostics": diag.get("chunk_diagnostics"),  # P0-1: 分片级诊断
+            "retrieval_diagnostics": chunk_diagnostics,
+            "retrieval_latency_ms": {
+                key: diag.get(key)
+                for key in (
+                    "preprocessing_time_ms",
+                    "hybrid_search_time_ms",
+                    "reranker_time_ms",
+                    "total_time_ms",
+                )
+                if diag.get(key) is not None
+            },
         }
         per_question.append(pq)
     return per_question
-
-
-class _JudgeCache:
-    """文件级 Judge LLM 响应缓存，避免重复实验时对相同 prompt 反复调用 API。
-
-    缓存 key 包含 Judge 模型、API 后端、温度、RAGAS 版本、指标 prompt
-    和完整消息，禁止不同 Judge 或评估版本之间交叉复用。
-    仅当 Judge temperature=0（确定性输出）时启用。
-    缓存文件存储在 reports/.judge_cache.json。
-    """
-
-    _CACHE_PATH = Path("reports/.judge_cache.json")
-
-    def __init__(self) -> None:
-        self._store: dict[str, Any] = {}
-        self._dirty = False
-        self._load()
-
-    def _load(self) -> None:
-        if self._CACHE_PATH.exists():
-            try:
-                self._store = json.loads(self._CACHE_PATH.read_text(encoding="utf-8"))
-            except Exception:
-                self._store = {}
-
-    def _save(self) -> None:
-        if not self._dirty:
-            return
-        self._CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        self._CACHE_PATH.write_text(
-            json.dumps(self._store, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        self._dirty = False
-
-    @staticmethod
-    def make_key(*parts: str) -> str:
-        raw = "||".join(parts)
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
-
-    def get(self, key: str) -> Any | None:
-        return self._store.get(key)
-
-    def set(self, key: str, value: Any) -> None:
-        self._store[key] = value
-        self._dirty = True
-
-    def persist(self) -> None:
-        self._save()
-
-
-# 模块级单例，跨问题共享缓存
-_JUDGE_CACHE = _JudgeCache()
 
 
 def _build_llm_wrapper(judge_timeout_s: int | None = None):
@@ -345,14 +383,14 @@ def _build_llm_wrapper(judge_timeout_s: int | None = None):
     为空时复用 DashScope 配置。
 
     当 eval_judge_temperature=0 时启用 Judge 缓存，相同 prompt 不重复调用 API。
-    缓存命中时会记录 cache_hit 日志；评估结束后自动持久化到 reports/.judge_cache.json。
+    缓存使用带命名空间的 SQLite 后端，模型、API、温度或 RAGAS 版本变化时
+    自动进入不同命名空间，避免跨 Judge 污染。
     """
     try:
         from ragas.llms import LangchainLLMWrapper
         from ragas.embeddings import LangchainEmbeddingsWrapper
         from langchain_openai import ChatOpenAI
-        from langchain_core.language_models import BaseChatModel
-        from langchain_core.outputs import ChatResult
+        from langchain_community.cache import SQLiteCache
         from app.config import config
         from app.services.vector_embedding_service import vector_embedding_service
 
@@ -361,6 +399,45 @@ def _build_llm_wrapper(judge_timeout_s: int | None = None):
 
         timeout = judge_timeout_s or config.llm_timeout
 
+        use_cache = config.eval_judge_temperature == 0.0
+        cache = None
+        if use_cache:
+            try:
+                ragas_version = importlib.metadata.version("ragas")
+            except importlib.metadata.PackageNotFoundError:
+                ragas_version = "unknown"
+            namespace = _judge_cache_namespace(
+                config.eval_judge_model,
+                judge_api_base,
+                config.eval_judge_temperature,
+                ragas_version,
+            )
+
+            class _NamespacedSQLiteCache(SQLiteCache):
+                def lookup(self, prompt: str, llm_string: str):
+                    metric = _judge_metric_name(prompt)
+                    return super().lookup(prompt, f"{namespace}||{metric}||{llm_string}")
+
+                def update(self, prompt: str, llm_string: str, return_val) -> None:
+                    from sqlalchemy.exc import IntegrityError
+
+                    metric = _judge_metric_name(prompt)
+                    try:
+                        super().update(
+                            prompt,
+                            f"{namespace}||{metric}||{llm_string}",
+                            return_val,
+                        )
+                    except IntegrityError:
+                        # RAGAS evaluates samples concurrently. Two workers can
+                        # miss the same key and race to insert an identical
+                        # response; the winning row is already a valid cache hit.
+                        logger.debug("Judge cache 并发写入命中已有 key，忽略重复结果")
+
+            cache_path = Path(config.eval_judge_cache_path)
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache = _NamespacedSQLiteCache(database_path=str(cache_path))
+
         llm = ChatOpenAI(
             model=config.eval_judge_model,
             temperature=config.eval_judge_temperature,
@@ -368,117 +445,8 @@ def _build_llm_wrapper(judge_timeout_s: int | None = None):
             base_url=judge_api_base,
             timeout=timeout,
             max_retries=config.llm_max_retries,
+            cache=cache,
         )
-
-        # 当 temperature=0 时，用文件缓存包裹 LLM，避免重复调用 API
-        use_cache = config.eval_judge_temperature == 0.0
-        if use_cache:
-            try:
-                ragas_version = importlib.metadata.version("ragas")
-            except importlib.metadata.PackageNotFoundError:
-                ragas_version = "unknown"
-            cache_namespace = json.dumps(
-                {
-                    "schema": 2,
-                    "model": config.eval_judge_model,
-                    "api_base": judge_api_base,
-                    "temperature": config.eval_judge_temperature,
-                    "ragas_version": ragas_version,
-                },
-                sort_keys=True,
-                ensure_ascii=False,
-            )
-
-            class _CachedChatOpenAI(type(llm)):  # type: ignore[valid-type]
-                """透明缓存代理，拦截 generate() 调用并缓存 ChatResult。"""
-
-                def generate(
-                    self,
-                    messages,
-                    stop=None,
-                    callbacks=None,
-                    **kwargs,
-                ):
-                    # 构建缓存 key：基于 messages 内容 + stop 条件
-                    batches = messages if isinstance(messages, list) else [messages]
-                    normalized_messages = []
-                    for batch_index, batch in enumerate(batches):
-                        batch_messages = batch if isinstance(batch, list) else [batch]
-                        for message_index, message in enumerate(batch_messages):
-                            normalized_messages.append(
-                                {
-                                    "batch": batch_index,
-                                    "index": message_index,
-                                    "type": type(message).__name__,
-                                    "content": getattr(message, "content", ""),
-                                }
-                            )
-                    msg_repr = json.dumps(
-                        normalized_messages,
-                        sort_keys=True,
-                        ensure_ascii=False,
-                        default=str,
-                    )
-                    system_prompts = [
-                        item["content"]
-                        for item in normalized_messages
-                        if item["type"] in {"SystemMessage", "SystemMessagePromptTemplate"}
-                    ]
-                    metric_signature = hashlib.sha256(
-                        "||".join(map(str, system_prompts)).encode("utf-8")
-                    ).hexdigest()[:16]
-                    key = _JUDGE_CACHE.make_key(
-                        cache_namespace,
-                        metric_signature,
-                        msg_repr,
-                        str(stop or ""),
-                    )
-                    cached = _JUDGE_CACHE.get(key)
-                    if cached is not None:
-                        logger.debug(f"[JudgeCache] hit: {key}")
-                        # 反序列化为 ChatResult
-                        from langchain_core.outputs import ChatGeneration, ChatResult
-                        generations = []
-                        for g in cached.get("generations", []):
-                            msg_cls = type(
-                                "AIMessage", (),
-                                {"content": g["text"], "type": "ai"}
-                            )
-                            generations.append(
-                                ChatGeneration(text=g["text"], message=msg_cls())
-                            )
-                        return ChatResult(
-                            generations=generations,
-                            llm_output=cached.get("llm_output"),
-                        )
-
-                    # 调用原始 LLM
-                    result = super(  # type: ignore[misc]
-                        self.__class__.__mro__[1], self
-                    ).generate(messages, stop=stop, callbacks=callbacks, **kwargs)
-
-                    # 序列化并缓存
-                    serialized = {
-                        "generations": [
-                            {"text": g.text}
-                            for g in (result.generations if result.generations else [])
-                        ],
-                        "llm_output": result.llm_output,
-                    }
-                    _JUDGE_CACHE.set(key, serialized)
-                    logger.debug(f"[JudgeCache] miss: {key} → cached")
-                    return result
-
-            # 动态创建缓存子类实例
-            cached_llm = _CachedChatOpenAI(
-                model=config.eval_judge_model,
-                temperature=config.eval_judge_temperature,
-                api_key=judge_api_key,
-                base_url=judge_api_base,
-                timeout=timeout,
-                max_retries=config.llm_max_retries,
-            )
-            llm = cached_llm
 
         # RAGAS 0.4 marks LangChain wrappers as deprecated, but they remain the
         # safest bridge here because the project uses OpenAI-compatible Judge
@@ -511,25 +479,49 @@ async def _generate_answers(
     questions: list,
     contexts_list: list[list[str]],
 ) -> list[str]:
-    """Phase 2: 通过 RagAgentService 为每个问题生成回答
+    """Phase 2: 让生成模型严格基于 Phase 1 的检索上下文回答。
 
-    每个问题使用独立的 session_id="eval_{i}" 确保互不干扰。
-    单条失败不阻塞整体流程，失败的问题对应 answer 为空字符串。
+    生成评估不能再次调用 Agent 的检索工具，否则用于评分的 contexts 与模型实际
+    看到的 contexts 可能不一致；加载无关 MCP 工具也会引入额外失败点。单条失败
+    不阻塞整体流程，失败的问题对应 answer 为空字符串。
     """
-    from app.services.rag_agent_service import rag_agent_service
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    from app.core.llm_factory import create_chat_qwen
+
+    model = create_chat_qwen(temperature=0.0, streaming=False)
 
     answers: list[str] = []
     total = len(questions)
 
-    logger.info(f"开始为 {total} 个问题生成 answer（通过 RAG Agent）...")
+    logger.info(f"开始为 {total} 个问题生成 answer（基于 Phase 1 固定 contexts）...")
 
     for i, (question, contexts) in enumerate(zip(questions, contexts_list)):
         try:
-            answer = await rag_agent_service.query(
-                question, session_id=f"eval_{i}"
+            context_text = "\n\n".join(
+                f"[上下文 {j + 1}]\n{context}" for j, context in enumerate(contexts)
             )
-            answers.append(answer if answer else "")
-            status = "✓" if answer else "✗(empty)"
+            response = await model.ainvoke(
+                [
+                    SystemMessage(
+                        content=(
+                            "你是智能运维知识库问答助手。只能依据给定上下文回答；"
+                            "上下文不足时明确说明，不得补充未经上下文支持的事实。"
+                            "回答应直接、完整，并保留必要的排查步骤和命令。"
+                        )
+                    ),
+                    HumanMessage(
+                        content=f"问题：\n{question}\n\n可用上下文：\n{context_text}"
+                    ),
+                ]
+            )
+            content = response.content if hasattr(response, "content") else str(response)
+            if isinstance(content, list):
+                content = " ".join(
+                    item.get("text", str(item)) if isinstance(item, dict) else str(item)
+                    for item in content
+                )
+            answers.append(str(content).strip() if content else "")
         except Exception as e:
             logger.error(f"[{i+1}/{total}] answer 生成失败: '{question[:40]}...' -> {e}")
             answers.append("")
@@ -557,12 +549,32 @@ def _compute_category_stats(
         cat_groups[pq["category"]].append(pq)
 
     for cat, items in sorted(cat_groups.items()):
+        precision_values = [
+            float(it["context_precision"])
+            for it in items
+            if it.get("context_precision") is not None
+        ]
+        recall_values = [
+            float(it["context_recall"])
+            for it in items
+            if it.get("context_recall") is not None
+        ]
         stats[cat] = {
             "count": len(items),
             "avg_contexts_count": round(
                 sum(it["contexts_count"] for it in items) / len(items), 1
             ),
             "answer_generated": sum(1 for it in items if it.get("answer_generated")),
+            "context_precision": round(
+                sum(precision_values) / len(precision_values), 4
+            )
+            if precision_values
+            else None,
+            "context_precision_n": len(precision_values),
+            "context_recall": round(sum(recall_values) / len(recall_values), 4)
+            if recall_values
+            else None,
+            "context_recall_n": len(recall_values),
         }
 
     return stats
@@ -754,20 +766,48 @@ def run_evaluation(
     logger.info("--- Phase 1: 检索评估 ---")
     non_llm_ks = (3, 5, 10)
     retrieval_pool_k = max(effective_top_k, max(non_llm_ks))
-    retrieval_pool_contexts, retrieval_pool_file_names, retrieval_diagnostics = _retrieve_docs(
+    (
+        retrieval_pool_contexts,
+        retrieval_pool_file_names,
+        retrieval_pool_section_ids,
+        retrieval_diagnostics,
+    ) = _retrieve_docs(
         retriever,
         list(questions),
         top_k=retrieval_pool_k,
     )
-    all_contexts = _truncate_contexts(retrieval_pool_contexts, effective_top_k)
-    all_file_names = [names[:effective_top_k] for names in retrieval_pool_file_names]
+    context_top_ks = [effective_top_k for _ in questions]
+    if config.rag_mode == "enhanced" and config.rag_query_routing:
+        from app.retriever.query_router import classify_query
+
+        context_top_ks = [
+            config.rag_cross_doc_top_k
+            if classify_query(question).query_type == "cross_doc"
+            else effective_top_k
+            for question in questions
+        ]
+    all_contexts = [
+        contexts[:query_top_k] if contexts != [""] else [""]
+        for contexts, query_top_k in zip(retrieval_pool_contexts, context_top_ks)
+    ]
+    all_file_names = [
+        names[:query_top_k]
+        for names, query_top_k in zip(retrieval_pool_file_names, context_top_ks)
+    ]
+    all_section_ids = [
+        sections[:query_top_k]
+        for sections, query_top_k in zip(retrieval_pool_section_ids, context_top_ks)
+    ]
     relevant_docs_map = testset["relevant_docs"]
+    relevant_sections_map = testset["relevant_sections"]
     per_question = _build_per_question_rows(
         questions=list(questions),
         categories=list(categories),
         contexts_list=all_contexts,
         file_names_list=all_file_names,
         relevant_docs_map=relevant_docs_map,
+        section_ids_list=all_section_ids,
+        relevant_sections_map=relevant_sections_map,
         retrieval_diagnostics=retrieval_diagnostics,
     )
 
@@ -872,13 +912,21 @@ def run_evaluation(
         ("context_precision", cp_per_sample),
         ("context_recall", cr_per_sample),
     ]:
-        if per_sample:
-            retrieval_ci[name] = _bootstrap_confidence_interval(per_sample)
+        valid_scores = [score for score in per_sample if score is not None]
+        if valid_scores:
+            retrieval_ci[name] = _bootstrap_confidence_interval(valid_scores)
         else:
             retrieval_ci[name] = {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "n": 0}
 
     # 计算非 LLM 检索指标（Hit Rate@k + MRR，基于 relevant_docs 标注）
-    from tests.evaluation.metrics import compute_hit_rate_multi_k, compute_mrr
+    from tests.evaluation.metrics import (
+        all_relevant_hit_at_k,
+        compute_hit_rate_multi_k,
+        compute_mrr,
+        document_coverage_at_k,
+        ndcg_at_k,
+        section_hit_at_k,
+    )
 
     hit_rates = compute_hit_rate_multi_k(
         retrieval_pool_file_names,
@@ -888,6 +936,55 @@ def run_evaluation(
     mrr = compute_mrr(retrieval_pool_file_names, relevant_docs_map)
 
     non_llm_metrics = {**hit_rates, "mrr": round(mrr, 4)}
+    for k in non_llm_ks:
+        non_llm_metrics[f"document_coverage@{k}"] = round(
+            document_coverage_at_k(retrieval_pool_file_names, relevant_docs_map, k), 4
+        )
+        non_llm_metrics[f"all_relevant_hit@{k}"] = round(
+            all_relevant_hit_at_k(retrieval_pool_file_names, relevant_docs_map, k), 4
+        )
+        non_llm_metrics[f"document_ndcg@{k}"] = round(
+            ndcg_at_k(retrieval_pool_file_names, relevant_docs_map, k), 4
+        )
+        section_hit = section_hit_at_k(
+            retrieval_pool_section_ids, relevant_sections_map, k
+        )
+        non_llm_metrics[f"section_hit@{k}"] = (
+            round(section_hit, 4) if section_hit is not None else None
+        )
+        non_llm_metrics[f"section_ndcg@{k}"] = round(
+            ndcg_at_k(retrieval_pool_section_ids, relevant_sections_map, k), 4
+        )
+
+    def _percentile(values: list[float], percentile: float) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = (len(ordered) - 1) * percentile
+        lower = int(math.floor(index))
+        upper = int(math.ceil(index))
+        if lower == upper:
+            return round(ordered[lower], 2)
+        value = ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+        return round(value, 2)
+
+    latency_metrics: dict[str, dict[str, float | int | None]] = {}
+    for stage in (
+        "preprocessing_time_ms",
+        "hybrid_search_time_ms",
+        "reranker_time_ms",
+        "total_time_ms",
+    ):
+        values = [
+            float(meta[stage])
+            for meta in retrieval_diagnostics
+            if meta.get(stage) is not None
+        ]
+        latency_metrics[stage] = {
+            "p50": _percentile(values, 0.50),
+            "p95": _percentile(values, 0.95),
+            "n": len(values),
+        }
 
     logger.info(f"  context_precision    : {retrieval_metrics['context_precision']:.4f}  (目标 ≥ 0.70)")
     logger.info(f"  context_recall       : {retrieval_metrics['context_recall']:.4f}  (目标 ≥ 0.70)")
@@ -899,9 +996,12 @@ def run_evaluation(
                 f"    {name} 95% CI: [{ci['ci_lower']:.4f}, {ci['ci_upper']:.4f}] "
                 f"(mean={ci['mean']:.4f}, n={ci['n']})"
             )
-    logger.info(f"  [非 LLM 指标]")
+    logger.info("  [非 LLM 指标]")
     for k, v in non_llm_metrics.items():
-        logger.info(f"    {k}: {v:.4f}")
+        logger.info(f"    {k}: {v:.4f}" if v is not None else f"    {k}: N/A")
+    logger.info("  [检索延迟]")
+    for stage, values in latency_metrics.items():
+        logger.info(f"    {stage}: p50={values['p50']}ms, p95={values['p95']}ms")
 
     # 将逐样本检索分数同步到 per_question。必须在 RAGAS evaluate 之后执行。
     for i in range(len(per_question)):
@@ -1010,13 +1110,14 @@ def run_evaluation(
                     ("faithfulness", faith_per_sample),
                     ("answer_relevancy", relev_per_sample),
                 ]:
-                    if per_sample:
-                        gen_ci[name] = _bootstrap_confidence_interval(per_sample)
+                    valid_scores = [score for score in per_sample if score is not None]
+                    if valid_scores:
+                        gen_ci[name] = _bootstrap_confidence_interval(valid_scores)
                     else:
                         gen_ci[name] = {"mean": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "n": 0}
                 if generation_metrics_mode == "full":
                     gen_ci["answer_correctness"] = _bootstrap_confidence_interval(
-                        corr_per_sample if corr_per_sample else []
+                        [score for score in corr_per_sample if score is not None]
                     )
                 generation_metrics["confidence_intervals"] = gen_ci
 
@@ -1046,7 +1147,8 @@ def run_evaluation(
         # 按 context_precision 分组分析 faithfulness
         high_retrieval = []
         low_retrieval = []
-        median_cp = sorted(cp_per_sample)[len(cp_per_sample) // 2] if cp_per_sample else 0.5
+        valid_cp = sorted(score for score in cp_per_sample if score is not None)
+        median_cp = valid_cp[len(valid_cp) // 2] if valid_cp else 0.5
 
         for pq in per_question:
             cp_val = pq.get("context_precision")
@@ -1068,7 +1170,7 @@ def run_evaluation(
                 "high_retrieval_count": len(high_retrieval),
                 "low_retrieval_count": len(low_retrieval),
             }
-            logger.info(f"  [检索→生成联合分析]")
+            logger.info("  [检索→生成联合分析]")
             logger.info(f"    高检索质量组 (CP ≥ {median_cp:.2f}) faithfulness 均值: {high_mean:.4f}")
             logger.info(f"    低检索质量组 (CP < {median_cp:.2f}) faithfulness 均值: {low_mean:.4f}")
             logger.info(f"    faithfulness 差距: {high_mean - low_mean:.4f}")
@@ -1101,6 +1203,28 @@ def run_evaluation(
         "retrieval_metrics": retrieval_metrics,
         "retrieval_confidence_intervals": retrieval_ci,
         "non_llm_metrics": non_llm_metrics,
+        "retrieval_latency_ms": latency_metrics,
+        "code_revision": _git_revision(),
+        "retrieval_config": {
+            "rag_top_k": config.rag_top_k,
+            "reranker_top_k": config.reranker_top_k,
+            "rerank_coarse_top_k": config.rerank_coarse_top_k,
+            "query_preprocessor_type": config.query_preprocessor_type,
+            "reranker_model": config.reranker_model,
+            "reranker_model_path": config.reranker_model_path,
+            "rag_diversify_by_file": config.rag_diversify_by_file,
+            "rag_query_routing": config.rag_query_routing,
+            "rag_cross_doc_top_k": config.rag_cross_doc_top_k,
+            "rag_section_prior": config.rag_section_prior,
+            "rag_diversity_score_margin": config.rag_diversity_score_margin,
+            "rag_max_chunks_per_file": config.rag_max_chunks_per_file,
+            "rag_parent_context": config.rag_parent_context,
+            "rag_parent_context_max_tokens": config.rag_parent_context_max_tokens,
+            "rag_chunk_strategy": config.rag_chunk_strategy,
+            "rag_include_section_prefix": config.rag_include_section_prefix,
+            "enhanced_collection_name": config.enhanced_collection_name,
+            "judge_cache_path": config.eval_judge_cache_path,
+        },
         "generation_metrics": generation_metrics if generation_metrics else None,
         "retrieval_gen_correlation": retrieval_gen_correlation,
         "category_stats": category_stats,
@@ -1111,7 +1235,7 @@ def run_evaluation(
     # 7. 打印摘要
     logger.info("=" * 60)
     logger.info("评估结果摘要")
-    logger.info(f"  [检索指标]")
+    logger.info("  [检索指标]")
     logger.info(f"    context_precision : {retrieval_metrics['context_precision']:.4f}  (目标 ≥ 0.70)")
     logger.info(f"    context_recall    : {retrieval_metrics['context_recall']:.4f}  (目标 ≥ 0.70)")
 
@@ -1122,7 +1246,7 @@ def run_evaluation(
     logger.info(f"    检索达标（≥ 0.70）: {'✅ 是' if retrieval_passed else '❌ 否'}")
 
     if generation_metrics and generation_metrics.get("faithfulness") is not None:
-        logger.info(f"  [生成指标]")
+        logger.info("  [生成指标]")
         logger.info(f"    faithfulness      : {generation_metrics['faithfulness']:.4f}")
         logger.info(f"    answer_relevancy  : {generation_metrics['answer_relevancy']:.4f}")
         if generation_metrics.get("answer_correctness") is not None:
@@ -1133,7 +1257,7 @@ def run_evaluation(
     if failed_samples:
         logger.warning(f"  失败样本: {len(failed_samples)} 条")
 
-    logger.info(f"  [分类统计]")
+    logger.info("  [分类统计]")
     for cat, info in category_stats.items():
         logger.info(f"    {cat}: {info['count']} 题, 平均 contexts={info['avg_contexts_count']}")
 
@@ -1156,12 +1280,6 @@ def run_evaluation(
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(scores, f, ensure_ascii=False, indent=2)
         logger.info(f"JSON 结果已保存: {json_path}")
-
-    # 持久化 Judge 缓存，下次评测复用
-    _JUDGE_CACHE.persist()
-    cache_count = len(_JUDGE_CACHE._store)
-    if cache_count > 0:
-        logger.info(f"Judge 缓存已持久化: {cache_count} 条 → {_JUDGE_CACHE._CACHE_PATH}")
 
     if csv_path:
         _save_csv(scores, str(csv_path))

@@ -25,7 +25,7 @@
 import statistics
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from langchain_core.documents import Document
 from loguru import logger
@@ -112,6 +112,124 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
 
         return selected[:top_k]
 
+    @classmethod
+    def _rank_with_section_prior(
+        cls,
+        reranker: Any,
+        fallback_docs: list[Document],
+        target_section_types: tuple[str, ...],
+        prior: float,
+        normalize_scores: bool,
+    ) -> list[Document]:
+        """Normalize per-query scores and optionally boost intent-matched sections."""
+        if not normalize_scores or not getattr(reranker, "last_scores", None):
+            return fallback_docs
+        raw_scores = [float(score) for score, _ in reranker.last_scores]
+        low, high = min(raw_scores), max(raw_scores)
+        span = high - low
+        adjusted: list[tuple[float, Document]] = []
+        for raw_score, doc in reranker.last_scores:
+            normalized = (float(raw_score) - low) / span if span > 1e-12 else 1.0
+            section_type = str((doc.metadata or {}).get("section_type", "general"))
+            boost = prior if section_type in target_section_types else 0.0
+            adjusted_score = normalized + boost
+            doc.metadata["_rerank_raw_score"] = float(raw_score)
+            doc.metadata["_rerank_normalized_score"] = normalized
+            doc.metadata["_rerank_adjusted_score"] = adjusted_score
+            adjusted.append((adjusted_score, doc))
+        adjusted.sort(key=lambda item: item[0], reverse=True)
+        reranker.last_scores = adjusted
+        return [doc for _, doc in adjusted]
+
+    @classmethod
+    def _guarded_cross_doc_diversity(
+        cls,
+        ranked_docs: list[Document],
+        top_k: int,
+        max_per_file: int,
+        score_margin: float,
+    ) -> list[Document]:
+        """Replace excessive same-file chunks only when relevance loss is bounded."""
+        selected = list(ranked_docs[:top_k])
+        outside = list(ranked_docs[top_k:])
+
+        def score(doc: Document) -> float:
+            return float((doc.metadata or {}).get("_rerank_adjusted_score", 0.0))
+
+        while True:
+            counts: dict[str, int] = {}
+            for doc in selected:
+                key = cls._doc_file_key(doc)
+                counts[key] = counts.get(key, 0) + 1
+            overfull = {key for key, count in counts.items() if key and count > max_per_file}
+            if not overfull:
+                break
+            replace_index = next(
+                (
+                    index
+                    for index in range(len(selected) - 1, -1, -1)
+                    if cls._doc_file_key(selected[index]) in overfull
+                ),
+                None,
+            )
+            candidate_index = next(
+                (
+                    index
+                    for index, doc in enumerate(outside)
+                    if counts.get(cls._doc_file_key(doc), 0) < max_per_file
+                ),
+                None,
+            )
+            if replace_index is None or candidate_index is None:
+                break
+            replacement = outside[candidate_index]
+            if score(selected[replace_index]) - score(replacement) > score_margin:
+                break
+            outside.append(selected[replace_index])
+            selected[replace_index] = outside.pop(candidate_index)
+
+        rank_map = {id(doc): rank for rank, doc in enumerate(ranked_docs)}
+        return sorted(selected, key=lambda doc: rank_map[id(doc)])
+
+    @staticmethod
+    def _expand_parent_context(
+        documents: list[Document], max_chars: int, max_tokens: int = 3000
+    ) -> list[Document]:
+        """Expand one child per parent while enforcing a shared context token budget."""
+        def truncate(text: str, budget: int) -> tuple[str, int]:
+            """Offline token estimate: CJK≈1 token, other text≈4 chars/token."""
+            used = 0.0
+            end = 0
+            for index, char in enumerate(text, 1):
+                cost = 1.0 if "\u4e00" <= char <= "\u9fff" else 0.25
+                if used + cost > budget:
+                    break
+                used += cost
+                end = index
+            return text[:end], max(1, int(used + 0.999))
+
+        expanded: list[Document] = []
+        seen_parents: set[str] = set()
+        remaining_tokens = max_tokens
+        for doc in documents:
+            if remaining_tokens <= 0:
+                break
+            metadata = dict(doc.metadata or {})
+            parent_id = str(metadata.get("parent_id", ""))
+            parent_content = str(metadata.get("_parent_content", ""))
+            if parent_id and parent_content and parent_id not in seen_parents:
+                seen_parents.add(parent_id)
+                metadata["context_expanded"] = "parent"
+                candidate = parent_content[:max_chars]
+            else:
+                metadata["context_expanded"] = "child"
+                candidate = doc.page_content
+            content, used_tokens = truncate(candidate, remaining_tokens)
+            remaining_tokens -= used_tokens
+            metadata["estimated_context_tokens"] = used_tokens
+            expanded.append(Document(page_content=content, metadata=metadata))
+        return expanded
+
     @staticmethod
     def _build_chunk_diagnostics(
         reranker: Any,
@@ -139,6 +257,7 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
 
         # 标记最终选中的文档 ID
         final_ids: set[int] = {id(doc) for doc in final_docs}
+        final_order = {id(doc): rank for rank, doc in enumerate(final_docs, 1)}
 
         # 确定截断原因
         def _truncation_reason(doc: Document, rank: int, selected: bool) -> Optional[str]:
@@ -156,9 +275,12 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             entry: Dict[str, Any] = {
                 "rank": rank,
                 "score": round(score, 6) if score is not None else None,
+                "raw_score": metadata.get("_rerank_raw_score"),
+                "adjusted_score": metadata.get("_rerank_adjusted_score"),
                 "selected": selected,  # backward-compatible alias
                 "selected_in_pool": selected,
                 "selected_in_context": False,  # evaluation layer fills this
+                "output_rank": final_order.get(id(doc)),
                 "truncation_reason": _truncation_reason(doc, rank, selected),
                 "file_name": metadata.get("_file_name", metadata.get("_source", "")),
                 "source": metadata.get("_source", ""),
@@ -166,6 +288,7 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
                 "h2": metadata.get("h2", "") or "",
                 "h3": metadata.get("h3", "") or "",
                 "content_preview": doc.page_content[:Content_PREVIEW_LEN].replace("\n", " "),
+                "chunk_id": metadata.get("chunk_id", ""),
             }
             chunk_entries.append(entry)
 
@@ -211,12 +334,20 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         """
         from app.config import config
         from app.retriever.preprocessing.factory import get_query_preprocessor
+        from app.retriever.query_router import classify_query
         from app.retriever.reranker.factory import get_reranker
         from app.services.enhanced_vector_store_manager import enhanced_vector_store_manager
 
         trace_id = uuid.uuid4().hex[:8]
         t_start = time.time()
         original_query = query
+        route = classify_query(query) if config.rag_query_routing else None
+        query_type = route.query_type if route else "general"
+        effective_top_k = (
+            max(top_k, config.rag_cross_doc_top_k)
+            if query_type == "cross_doc"
+            else top_k
+        )
 
         meta: Dict[str, Any] = {
             "trace_id": trace_id,
@@ -230,22 +361,31 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             "rerank_pool_k": 0,
             "diversify_by_file": config.rag_diversify_by_file,
             "final_count": 0,
+            "query_type": query_type,
+            "requested_top_k": top_k,
+            "effective_top_k": effective_top_k,
             "total_time_ms": 0,
         }
 
         # ----------------------------------------------------------------
         # Step 1: Query Preprocessing（降级：失败时回退原始 query）
         # ----------------------------------------------------------------
-        preprocessor = get_query_preprocessor(config.query_preprocessor_type)
-        try:
-            search_query = preprocessor.process(query)
-        except Exception as e:
-            logger.warning(
-                f"[Enhanced][{trace_id}] 预处理失败，回退到原始查询: {e}"
-            )
+        t_stage1 = time.time()
+        if route and route.skip_rewrite:
             search_query = original_query
-            meta["degraded_stage"] = "preprocessing"
-            meta["fallback_reason"] = f"预处理失败: {e}"
+            meta["rewrite_skipped_by_router"] = True
+        else:
+            preprocessor = get_query_preprocessor(config.query_preprocessor_type)
+            try:
+                search_query = preprocessor.process(query)
+            except Exception as e:
+                logger.warning(
+                    f"[Enhanced][{trace_id}] 预处理失败，回退到原始查询: {e}"
+                )
+                search_query = original_query
+                meta["degraded_stage"] = "preprocessing"
+                meta["fallback_reason"] = f"预处理失败: {e}"
+        meta["preprocessing_time_ms"] = int((time.time() - t_stage1) * 1000)
 
         meta["search_query"] = search_query if debug else search_query[:80]
 
@@ -307,8 +447,11 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
         # 注意：精排使用 original_query，而非 search_query（可能是改写后的查询）
         # ----------------------------------------------------------------
         t_stage3 = time.time()
-        rerank_pool_k = top_k
-        if config.rag_diversify_by_file:
+        rerank_pool_k = effective_top_k
+        if route and route.query_type in {"procedural", "cross_doc"}:
+            # Section prior and guarded diversity need candidates outside final Top-K.
+            rerank_pool_k = len(candidates)
+        elif config.rag_diversify_by_file:
             multiplier = max(1, config.rag_diversify_candidate_multiplier)
             rerank_pool_k = min(len(candidates), max(top_k, top_k * multiplier))
         meta["rerank_pool_k"] = rerank_pool_k
@@ -321,19 +464,41 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
                 documents=candidates,
                 top_k=rerank_pool_k,
             )
-            if config.rag_diversify_by_file:
-                final_docs = self._diversify_by_file(reranked_docs, top_k=top_k)
+            target_sections = route.target_section_types if route else ()
+            ranked_docs = self._rank_with_section_prior(
+                reranker,
+                fallback_docs=reranked_docs,
+                target_section_types=target_sections,
+                prior=config.rag_section_prior if config.rag_query_routing else 0.0,
+                normalize_scores=(
+                    config.rag_query_routing
+                    and (bool(target_sections) or query_type == "cross_doc")
+                ),
+            )
+            if query_type == "cross_doc" and config.rag_query_routing:
+                final_docs = self._guarded_cross_doc_diversity(
+                    ranked_docs,
+                    top_k=effective_top_k,
+                    max_per_file=config.rag_max_chunks_per_file,
+                    score_margin=config.rag_diversity_score_margin,
+                )
+            elif config.rag_diversify_by_file:
+                final_docs = self._diversify_by_file(
+                    ranked_docs, top_k=effective_top_k
+                )
             else:
-                final_docs = reranked_docs[:top_k]
+                final_docs = ranked_docs[:effective_top_k]
         except Exception as e:
             logger.warning(
                 f"[Enhanced][{trace_id}] 精排失败，回退到粗排截断 top_k={top_k}: {e}"
             )
             fallback_docs = candidates[:rerank_pool_k]
             if config.rag_diversify_by_file:
-                final_docs = self._diversify_by_file(fallback_docs, top_k=top_k)
+                final_docs = self._diversify_by_file(
+                    fallback_docs, top_k=effective_top_k
+                )
             else:
-                final_docs = fallback_docs[:top_k]
+                final_docs = fallback_docs[:effective_top_k]
             rerank_source = "coarse_truncation"
             if meta["degraded_stage"] is None:
                 meta["degraded_stage"] = "reranker"
@@ -354,11 +519,23 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
             rerank_source=rerank_source,
             candidates=candidates,
             final_docs=final_docs,
-            top_k=top_k,
-            diversify_by_file=config.rag_diversify_by_file,
+            top_k=effective_top_k,
+            diversify_by_file=(
+                config.rag_diversify_by_file
+                or (query_type == "cross_doc" and config.rag_query_routing)
+            ),
         )
         meta["chunk_diagnostics"] = chunk_diagnostics
         meta["rerank_source"] = rerank_source
+
+        output_docs = final_docs
+        if config.rag_parent_context:
+            output_docs = self._expand_parent_context(
+                final_docs,
+                max_chars=config.rag_parent_context_max_chars,
+                max_tokens=config.rag_parent_context_max_tokens,
+            )
+        meta["parent_context_expanded"] = config.rag_parent_context
 
         self.last_retrieval_meta = meta
 
@@ -389,7 +566,7 @@ class EnhancedRAGRetriever(BaseRAGRetriever):
                 f"original_query='{original_query}', "
                 f"search_query='{search_query}', "
                 f"candidate_sources={[d.metadata.get('_source','?')[:40] for d in candidates[:5]]}, "
-                f"final_sources={[d.metadata.get('_source','?')[:40] for d in final_docs]}"
+                f"final_sources={[d.metadata.get('_source','?')[:40] for d in output_docs]}"
             )
 
-        return final_docs
+        return output_docs

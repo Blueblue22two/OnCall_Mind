@@ -104,13 +104,18 @@ ground_truth 拼接规则：
 """
 
 import random
+import re
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from datasets import Dataset
 
 # ---------------------------------------------------------------------------
 # 数据集版本号 — 修改测试集内容后递增
 # ---------------------------------------------------------------------------
-DATASET_VERSION = "1.3.1"
+DATASET_VERSION = "1.4.0"
 
 # ---------------------------------------------------------------------------
 # 数据集划分配置
@@ -136,6 +141,9 @@ class EvalSample:
         gen_expected_facts:       生成评估：答案必须包含的关键事实（可选，若空则 fallback 到 ground_truths）
         gen_forbidden_content:    生成评估：答案不应包含的内容（可选，用于幻觉检测）
         gen_min_length:           生成评估：最小期望答案长度（字符数），0=不检查
+        relevant_sections:        相关章节标识，格式为 ``file.md::H2标题``
+        fact_sources:             每条 ground truth 对应的章节标识列表
+        split_hint:               可选固定 split；新增定向样本不得扰动冻结 test
     """
 
     question: str
@@ -146,6 +154,9 @@ class EvalSample:
     gen_expected_facts: List[str] = field(default_factory=list)
     gen_forbidden_content: List[str] = field(default_factory=list)
     gen_min_length: int = 0
+    relevant_sections: List[str] = field(default_factory=list)
+    fact_sources: List[List[str]] = field(default_factory=list)
+    split_hint: Optional[str] = None
 
 
 def validate_testset(samples: List[EvalSample]) -> List[str]:
@@ -182,6 +193,23 @@ def validate_testset(samples: List[EvalSample]) -> List[str]:
             errors.append(
                 f"{prefix} category='{s.category}' 不在有效值 {valid_categories} 中"
             )
+
+        if s.fact_sources and len(s.fact_sources) != len(s.ground_truths):
+            errors.append(
+                f"{prefix} fact_sources 数量({len(s.fact_sources)})必须等于 "
+                f"ground_truths 数量({len(s.ground_truths)})"
+            )
+        if not s.fact_sources:
+            errors.append(f"{prefix} fact_sources 为空，v1.4.0 要求每条事实可追溯")
+        for section in s.relevant_sections:
+            if "::" not in section:
+                errors.append(f"{prefix} relevant_sections 格式错误: {section}")
+        for sources in s.fact_sources:
+            for section in sources:
+                if "::" not in section:
+                    errors.append(f"{prefix} fact_sources 格式错误: {section}")
+        if s.split_hint not in {None, "train", "dev", "test"}:
+            errors.append(f"{prefix} split_hint 无效: {s.split_hint}")
 
     return errors
 
@@ -226,11 +254,15 @@ def split_dataset(
 
     rng = random.Random(seed)
 
-    # 按 stratify_by 分组
+    # 固定 split 的新增样本不参与随机划分，避免扰动已冻结 test membership。
     from collections import defaultdict
 
     groups: Dict[str, List[EvalSample]] = defaultdict(list)
+    pinned: Dict[str, List[EvalSample]] = {"train": [], "dev": [], "test": []}
     for s in samples:
+        if s.split_hint:
+            pinned[s.split_hint].append(s)
+            continue
         key = getattr(s, stratify_by, "unknown")
         groups[key].append(s)
 
@@ -258,6 +290,10 @@ def split_dataset(
     rng.shuffle(train_set)
     rng.shuffle(dev_set)
     rng.shuffle(test_set)
+
+    train_set.extend(pinned["train"])
+    dev_set.extend(pinned["dev"])
+    test_set.extend(pinned["test"])
 
     return train_set, dev_set, test_set
 
@@ -299,6 +335,8 @@ def _build_dataset_from_samples(samples: List[EvalSample]) -> "Dataset":
     gen_expected_facts_list = []
     gen_forbidden_content_list = []
     gen_min_length_list = []
+    relevant_sections_list = []
+    fact_sources_list = []
 
     for s in samples:
         questions.append(s.question)
@@ -310,6 +348,8 @@ def _build_dataset_from_samples(samples: List[EvalSample]) -> "Dataset":
         )
         gen_forbidden_content_list.append(s.gen_forbidden_content)
         gen_min_length_list.append(s.gen_min_length)
+        relevant_sections_list.append(s.relevant_sections)
+        fact_sources_list.append(s.fact_sources)
 
     return Dataset.from_dict({
         "question": questions,
@@ -319,6 +359,8 @@ def _build_dataset_from_samples(samples: List[EvalSample]) -> "Dataset":
         "gen_expected_facts": gen_expected_facts_list,
         "gen_forbidden_content": gen_forbidden_content_list,
         "gen_min_length": gen_min_length_list,
+        "relevant_sections": relevant_sections_list,
+        "fact_sources": fact_sources_list,
     })
 
 
@@ -1928,7 +1970,299 @@ EVALUATION_DATASET: List[EvalSample] = [
             '磁盘空间排查可通过查找最大文件和目录，区分日志、临时文件或 Docker 未使用资源。',
         ],
     ),
+    # v1.4.0 定向补充：固定加入 dev，扩充跨文档覆盖评估且不改变冻结 test。
+    EvalSample(
+        question="API 5xx 和网络延迟同时升高，怎么串联排查？",
+        ground_truths=[
+            "先在同一时间窗口核对 API 错误日志、错误类型和受影响接口。",
+            "再检查网络延迟、超时、DNS 和下游服务响应，判断网络是否为 5xx 的诱因。",
+            "同时检查 CPU 和内存，排除资源瓶颈造成的共同症状。",
+        ],
+        relevant_docs=["api_error_rate_spike.md", "network_high_latency.md"],
+        category="cross_doc",
+        relevant_sections=[
+            "api_error_rate_spike.md::排查步骤",
+            "network_high_latency.md::排查步骤",
+        ],
+        fact_sources=[
+            ["api_error_rate_spike.md::排查步骤"],
+            ["network_high_latency.md::排查步骤"],
+            [
+                "api_error_rate_spike.md::排查步骤",
+                "network_high_latency.md::排查步骤",
+            ],
+        ],
+        split_hint="dev",
+    ),
+    EvalSample(
+        question="缓存雪崩后连接池也耗尽、接口越来越慢，排查链路是什么？",
+        ground_truths=[
+            "先确认缓存命中率下降与数据库查询激增是否发生在同一时间窗口。",
+            "检查数据库连接池活跃、空闲和等待连接数，并排查慢查询或连接泄漏。",
+            "结合接口耗时定位缓存失效、数据库瓶颈与慢响应之间的因果链。",
+        ],
+        relevant_docs=[
+            "cache_avalanche.md",
+            "database_connection_pool_exhaustion.md",
+            "slow_response.md",
+        ],
+        category="cross_doc",
+        relevant_sections=[
+            "cache_avalanche.md::排查步骤",
+            "database_connection_pool_exhaustion.md::排查步骤",
+            "slow_response.md::排查步骤",
+        ],
+        fact_sources=[
+            ["cache_avalanche.md::排查步骤"],
+            ["database_connection_pool_exhaustion.md::排查步骤"],
+            ["slow_response.md::排查步骤"],
+        ],
+        split_hint="dev",
+    ),
+    EvalSample(
+        question="Pod OOMKilled 后服务不可用，要把哪些证据串起来？",
+        ground_truths=[
+            "核对容器退出原因、重启次数和 OOMKilled 时间。",
+            "检查进程或容器内存趋势、限制配置和是否存在内存泄漏。",
+            "将 OOM 时间与服务健康检查、依赖状态和不可用日志对齐。",
+        ],
+        relevant_docs=[
+            "container_oom_killed.md",
+            "memory_high_usage.md",
+            "service_unavailable.md",
+        ],
+        category="cross_doc",
+        relevant_sections=[
+            "container_oom_killed.md::排查步骤",
+            "memory_high_usage.md::排查步骤",
+            "service_unavailable.md::排查步骤",
+        ],
+        fact_sources=[
+            ["container_oom_killed.md::排查步骤"],
+            ["memory_high_usage.md::排查步骤"],
+            ["service_unavailable.md::排查步骤"],
+        ],
+        split_hint="dev",
+    ),
+    EvalSample(
+        question="消息积压时 CPU 和内存也报警，如何判断是消费者还是资源瓶颈？",
+        ground_truths=[
+            "先检查消费者处理速率、实例数、线程数和批次大小。",
+            "对齐 CPU 高占用进程与消息消费服务，判断计算资源是否限制消费能力。",
+            "检查内存增长、OOM 或 GC 情况，确认是否因内存压力拖慢消费者。",
+        ],
+        relevant_docs=[
+            "message_queue_backlog.md",
+            "cpu_high_usage.md",
+            "memory_high_usage.md",
+        ],
+        category="cross_doc",
+        relevant_sections=[
+            "message_queue_backlog.md::排查步骤",
+            "cpu_high_usage.md::排查步骤",
+            "memory_high_usage.md::排查步骤",
+        ],
+        fact_sources=[
+            ["message_queue_backlog.md::排查步骤"],
+            ["cpu_high_usage.md::排查步骤"],
+            ["memory_high_usage.md::排查步骤"],
+        ],
+        split_hint="dev",
+    ),
+    EvalSample(
+        question="接口变慢且数据库连接等待和网络延迟同时升高，先查哪条链路？",
+        ground_truths=[
+            "先用接口耗时和慢请求日志确定受影响范围与时间窗口。",
+            "检查连接池等待、活跃连接和数据库性能，判断是否为数据库侧瓶颈。",
+            "检查网络超时、DNS 和下游响应，并与接口慢请求时间对齐。",
+        ],
+        relevant_docs=[
+            "slow_response.md",
+            "database_connection_pool_exhaustion.md",
+            "network_high_latency.md",
+        ],
+        category="cross_doc",
+        relevant_sections=[
+            "slow_response.md::排查步骤",
+            "database_connection_pool_exhaustion.md::排查步骤",
+            "network_high_latency.md::排查步骤",
+        ],
+        fact_sources=[
+            ["slow_response.md::排查步骤"],
+            ["database_connection_pool_exhaustion.md::排查步骤"],
+            ["network_high_latency.md::排查步骤"],
+        ],
+        split_hint="dev",
+    ),
+    EvalSample(
+        question="日志写满磁盘后服务启动失败，如何从磁盘一路排到服务恢复？",
+        ground_truths=[
+            "先确认磁盘和 inode 使用率，并定位持续增长的日志文件。",
+            "安全清理或轮转日志释放空间，避免直接删除仍被进程占用的文件。",
+            "随后检查服务启动日志、配置和依赖状态，重启后验证健康检查。",
+        ],
+        relevant_docs=["disk_high_usage.md", "service_unavailable.md"],
+        category="cross_doc",
+        relevant_sections=[
+            "disk_high_usage.md::排查步骤",
+            "disk_high_usage.md::紧急处理措施",
+            "service_unavailable.md::排查步骤",
+            "service_unavailable.md::验证步骤",
+        ],
+        fact_sources=[
+            ["disk_high_usage.md::排查步骤"],
+            ["disk_high_usage.md::紧急处理措施"],
+            [
+                "service_unavailable.md::排查步骤",
+                "service_unavailable.md::验证步骤",
+            ],
+        ],
+        split_hint="dev",
+    ),
+    EvalSample(
+        question="流量突增后 API 报错、缓存 miss 和连接池等待同时出现，如何联合止血？",
+        ground_truths=[
+            "先限流或降级，降低错误请求对核心业务和下游数据库的冲击。",
+            "预热热点缓存并调整过期策略，减少 cache miss 导致的数据库压力。",
+            "检查连接池等待与慢查询，必要时临时扩容并持续验证错误率和延迟。",
+        ],
+        relevant_docs=[
+            "api_error_rate_spike.md",
+            "cache_avalanche.md",
+            "database_connection_pool_exhaustion.md",
+        ],
+        category="cross_doc",
+        relevant_sections=[
+            "api_error_rate_spike.md::紧急处理措施",
+            "cache_avalanche.md::紧急处理措施",
+            "database_connection_pool_exhaustion.md::紧急处理措施",
+        ],
+        fact_sources=[
+            ["api_error_rate_spike.md::紧急处理措施"],
+            ["cache_avalanche.md::紧急处理措施"],
+            ["database_connection_pool_exhaustion.md::紧急处理措施"],
+        ],
+        split_hint="dev",
+    ),
 ]
+
+
+def _section_shingles(text: str) -> set[str]:
+    normalized = re.sub(r"\s+", "", text.lower())
+    chinese = "".join(char for char in normalized if "\u4e00" <= char <= "\u9fff")
+    shingles = {chinese[i : i + 2] for i in range(max(0, len(chinese) - 1))}
+    shingles.update(re.findall(r"[a-z][a-z0-9_./-]+", normalized))
+    return shingles
+
+
+def _load_sop_sections() -> Dict[str, Dict[str, str]]:
+    """Load the versioned SOP corpus used to produce v1.4.0 fact-source labels."""
+    docs_dir = Path(__file__).resolve().parents[2] / "aiops-docs"
+    result: Dict[str, Dict[str, str]] = {}
+    for path in docs_dir.glob("*.md"):
+        content = path.read_text(encoding="utf-8")
+        matches = list(re.finditer(r"^##\s+(.+?)\s*$", content, flags=re.MULTILINE))
+        sections: Dict[str, str] = {}
+        for index, match in enumerate(matches):
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+            sections[match.group(1).strip()] = content[match.start() : end]
+        result[path.name] = sections
+    return result
+
+
+def _apply_corpus_fact_source_audit() -> None:
+    """Map every unlabeled fact to the best-matching H2 section in its source SOP."""
+    corpus = _load_sop_sections()
+    for sample in EVALUATION_DATASET:
+        if sample.fact_sources:
+            continue
+        mapped_facts: List[List[str]] = []
+        for fact in sample.ground_truths:
+            fact_terms = _section_shingles(fact)
+            candidates: List[Tuple[float, str]] = []
+            for doc_name in sample.relevant_docs:
+                for section_name, section_text in corpus.get(doc_name, {}).items():
+                    section_terms = _section_shingles(section_text)
+                    overlap = len(fact_terms & section_terms) / max(1, len(fact_terms))
+                    candidates.append((overlap, f"{doc_name}::{section_name}"))
+            if not candidates:
+                raise ValueError(f"无法为事实定位 SOP section: {sample.question} / {fact}")
+            mapped_facts.append([max(candidates, key=lambda item: item[0])[1]])
+        sample.fact_sources = mapped_facts
+        sample.relevant_sections = list(
+            dict.fromkeys(section for sources in mapped_facts for section in sources)
+        )
+
+
+# dev 的高风险/跨文档标签经过人工复核；其余标签由固定 v1.4.0 SOP 语料匹配生成。
+# 问题文本作为人工覆盖的稳定主键。
+_REVIEWED_SECTION_LABELS: Dict[str, List[str]] = {
+    "NetworkHighLatency 告警的触发条件是什么？": ["network_high_latency.md::告警名称"],
+    "缓存命中率低但数据库 QPS 没升高，还能直接判定缓存雪崩吗？": [
+        "cache_avalanche.md::常见原因分析"
+    ],
+    "遇到数据库连接池耗尽怎么办？": [
+        "database_connection_pool_exhaustion.md::排查步骤",
+        "database_connection_pool_exhaustion.md::紧急处理措施",
+    ],
+    "怎么处理 API 错误率突然升高的问题？": ["api_error_rate_spike.md::排查步骤"],
+    "DatabaseConnectionPoolExhaustion 告警的触发条件是什么？": [
+        "database_connection_pool_exhaustion.md::告警名称"
+    ],
+    "磁盘空间满会怎样把服务不可用和消息积压串起来？": [
+        "disk_high_usage.md::常见原因分析",
+        "service_unavailable.md::常见原因分析",
+        "message_queue_backlog.md::常见原因分析",
+    ],
+    "日志把磁盘写满了，可以直接清空吗？怎么操作？": [
+        "disk_high_usage.md::常见原因分析",
+        "disk_high_usage.md::常用命令",
+    ],
+    "网络延迟过高时，怎么判断是链路问题还是服务自身问题？": [
+        "network_high_latency.md::排查步骤",
+        "network_high_latency.md::常见原因分析",
+    ],
+    "遇到CPU100%怎么紧急处理？限流还是扩容？": ["cpu_high_usage.md::紧急处理措施"],
+    "服务完全不可用但监控只看到高内存和磁盘满，先判断哪些资源耗尽路径？": [
+        "service_unavailable.md::常见原因分析",
+        "memory_high_usage.md::排查步骤",
+        "disk_high_usage.md::排查步骤",
+    ],
+    "数据库连接池满了以后接口响应慢，应该怎么联动排查？": [
+        "database_connection_pool_exhaustion.md::排查步骤",
+        "slow_response.md::常见原因分析",
+    ],
+    "CPU 告警后，我要怎么查是哪个进程在吃 CPU？": ["cpu_high_usage.md::排查步骤"],
+    "OOM是不是因为缓存配置不对？": ["memory_high_usage.md::常见原因分析"],
+    "接口慢得离谱但没有报错，通常要看哪些方向？": [
+        "slow_response.md::常见原因分析",
+        "database_connection_pool_exhaustion.md::常见原因分析",
+        "network_high_latency.md::常见原因分析",
+    ],
+    "磁盘满了会影响消息队列吗？": ["message_queue_backlog.md::常见原因分析"],
+    "消费者 lag 越来越大，但生产者只是正常发消息，可能是哪边的问题？": [
+        "message_queue_backlog.md::常见原因分析"
+    ],
+    "Pod 被 OOMKilled 后自动重启成功，还需要继续分析吗？": [
+        "container_oom_killed.md::验证步骤",
+        "memory_high_usage.md::常见原因分析",
+    ],
+    "缓存击穿会导致接口变慢吗？": ["slow_response.md::常见原因分析"],
+}
+
+
+def _apply_reviewed_fact_sources() -> None:
+    """Attach reviewed section evidence to every fact in reviewed samples."""
+    for sample in EVALUATION_DATASET:
+        sections = _REVIEWED_SECTION_LABELS.get(sample.question, [])
+        if not sections:
+            continue
+        sample.relevant_sections = list(sections)
+        sample.fact_sources = [list(sections) for _ in sample.ground_truths]
+
+
+_apply_corpus_fact_source_audit()
+_apply_reviewed_fact_sources()
 
 
 def get_eval_dataset():
@@ -1951,6 +2285,8 @@ def get_eval_dataset():
     gen_expected_facts_list = []
     gen_forbidden_content_list = []
     gen_min_length_list = []
+    relevant_sections_list = []
+    fact_sources_list = []
 
     for s in EVALUATION_DATASET:
         questions.append(s.question)
@@ -1963,6 +2299,8 @@ def get_eval_dataset():
         )
         gen_forbidden_content_list.append(s.gen_forbidden_content)
         gen_min_length_list.append(s.gen_min_length)
+        relevant_sections_list.append(s.relevant_sections)
+        fact_sources_list.append(s.fact_sources)
 
     return Dataset.from_dict({
         "question": questions,
@@ -1972,4 +2310,6 @@ def get_eval_dataset():
         "gen_expected_facts": gen_expected_facts_list,
         "gen_forbidden_content": gen_forbidden_content_list,
         "gen_min_length": gen_min_length_list,
+        "relevant_sections": relevant_sections_list,
+        "fact_sources": fact_sources_list,
     })

@@ -29,6 +29,7 @@ class Settings(BaseSettings):
     dashscope_api_base: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     dashscope_model: str = "qwen-max"
     dashscope_embedding_model: str = "text-embedding-v4"
+    embedding_batch_size: int = 10  # DashScope text-embedding-v4 单批上限
 
     # LLM 统一调用配置（P0-1.1: 收敛所有硬编码参数）
     llm_temperature: float = 0.0        # 默认温度（规划/执行类节点使用 0，对话类可覆盖）
@@ -69,6 +70,15 @@ class Settings(BaseSettings):
     rerank_coarse_top_k: int = 10    # enhanced 模式粗排候选数（P0-1.3: 20→10 精排耗时减半）
     rag_diversify_by_file: bool = False  # 是否在 Enhanced 最终 Top-K 中优先覆盖不同来源文件
     rag_diversify_candidate_multiplier: int = 3  # 多样性选择前保留的精排候选倍数
+    rag_query_routing: bool = False  # 实验开关：规则式查询路由
+    rag_cross_doc_top_k: int = 5
+    rag_section_prior: float = 0.10
+    rag_diversity_score_margin: float = 0.15
+    rag_max_chunks_per_file: int = 2
+    rag_parent_context: bool = False
+    rag_parent_context_max_chars: int = 2400
+    rag_parent_context_max_tokens: int = 3000
+    enhanced_collection_name: str = "biz_enhanced"  # A/B 索引可切到 biz_enhanced_v2
 
     # ------------------------------------------------------------------
     # 评估 Judge 配置（独立于线上 RAG 模型，确保评估可复现）
@@ -77,10 +87,13 @@ class Settings(BaseSettings):
     eval_judge_temperature: float = 0.0
     eval_judge_api_base: str = ""   # 空则复用 DASHSCOPE_API_BASE
     eval_judge_api_key: str = ""    # 空则复用 DASHSCOPE_API_KEY
+    eval_judge_cache_path: str = "reports/judge_cache.sqlite"
 
     # 文档分块配置
     chunk_max_size: int = 800
     chunk_overlap: int = 100
+    rag_chunk_strategy: Literal["legacy", "section_child"] = "legacy"
+    rag_include_section_prefix: bool = False
 
     # Redis 配置（可选，不配置则使用 MemorySaver）
     redis_url: str = ""  # 如 "redis://localhost:6379"

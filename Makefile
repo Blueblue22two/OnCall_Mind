@@ -23,7 +23,12 @@ NC = \033[0m
         ipython watch add add-dev remove list-docs test-upload sync logs \
         start-cls stop-cls start-monitor stop-monitor start-api stop-api status-mcp \
         docker-build docker-up docker-down docker-logs docker-status docker-push \
-        docker-push-versioned docker-shell
+        docker-push-versioned docker-shell index-rag-v4-basic index-rag-v4-raw index-rag-v4-prefix \
+        index-rag-v4-child eval-rag-v4-clean-cache eval-rag-v4-raw \
+        eval-rag-v4-prefix eval-rag-v4-child eval-rag-v4-parent \
+        eval-rag-v4-adaptive eval-rag-v4-priors eval-rag-v4-ablation \
+        eval-rag-v4-ablation-resume eval-rag-v4-basic eval-rag-v4-gate \
+        eval-rag-v4-test
 
 # ============================================================
 # 默认目标：显示帮助信息
@@ -87,6 +92,7 @@ help:
 	@echo "  $(YELLOW)make eval-validate-dataset$(NC) - 🔍 验证数据集质量"
 	@echo "  $(YELLOW)make eval-baseline-save$(NC)  - 📌 保存当前结果为基线"
 	@echo "  $(YELLOW)make eval-baseline-check$(NC) - 📊 与基线对比检查退化"
+	@echo "  $(YELLOW)make eval-rag-v4-ablation$(NC) - 🔬 构建隔离索引并运行 v4 分块消融"
 	@echo ""
 	@echo "$(CYAN)【其他】$(NC)"
 	@echo "  $(YELLOW)make clean$(NC)        - 🧹 清理临时文件"
@@ -583,10 +589,113 @@ test-quick:  ## 快速测试
 
 EVAL_RAG_MODE    ?= basic
 EVAL_OUTPUT_DIR  ?= reports
+V4_JUDGE_MODEL   ?= qwen3.5-plus
+V4_SECTION_PRIOR ?= 0.10
+
+V4_EVAL_ENV = RAG_MODE=enhanced QUERY_PREPROCESSOR_TYPE=rewrite \
+	RERANKER_TYPE=cross_encoder RERANK_COARSE_TOP_K=20 \
+	EVAL_JUDGE_MODEL=$(V4_JUDGE_MODEL)
+V4_EVAL_ARGS = --split dev --retrieval-metrics minimal --ragas-max-workers 4
 
 eval-rag:  ## 运行 RAG 检索评估（用法: make eval-rag [EVAL_RAG_MODE=basic|enhanced]）
 	@echo "$(YELLOW)🧪 运行 RAG 检索评估 (mode=$(EVAL_RAG_MODE))...$(NC)"
 	RAG_MODE=$(EVAL_RAG_MODE) .venv/bin/python -m tests.evaluation.evaluate_rag --output $(EVAL_OUTPUT_DIR)/eval_$(EVAL_RAG_MODE)_latest.json
+
+index-rag-v4-basic:  ## 用审计后的 SOP 重建 Basic 基线索引
+	.venv/bin/python -m tests.evaluation.index_rag_variant --basic --strategy legacy
+
+index-rag-v4-raw:  ## 构建 v4 原始分块隔离索引
+	.venv/bin/python -m tests.evaluation.index_rag_variant \
+		--collection biz_enhanced_v4_raw --strategy legacy
+
+index-rag-v4-prefix:  ## 构建 v4 标题/section 前缀隔离索引
+	.venv/bin/python -m tests.evaluation.index_rag_variant \
+		--collection biz_enhanced_v4_prefix --strategy legacy --include-section-prefix
+
+index-rag-v4-child:  ## 构建 v4 H3 child 隔离索引（也供 parent context 使用）
+	.venv/bin/python -m tests.evaluation.index_rag_variant \
+		--collection biz_enhanced_v4_child --strategy section_child --include-section-prefix
+
+eval-rag-v4-clean-cache:  ## 清理 v4 专用 Judge 缓存（不影响常规缓存）
+	rm -f $(EVAL_OUTPUT_DIR)/judge_cache_v4_*.sqlite
+
+eval-rag-v4-basic:  ## 使用 v1.4.0 数据和独立 Judge 缓存重跑 Basic
+	RAG_MODE=basic EVAL_JUDGE_MODEL=$(V4_JUDGE_MODEL) \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_basic.sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag $(V4_EVAL_ARGS) \
+		--output $(EVAL_OUTPUT_DIR)/eval_basic_dev_v4.json
+
+eval-rag-v4-raw:  ## v4 消融 1：原始分块
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_raw \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_raw.sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag $(V4_EVAL_ARGS) \
+		--output $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_raw.json
+
+eval-rag-v4-prefix:  ## v4 消融 2：标题和 section 前缀
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_prefix \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_prefix.sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag $(V4_EVAL_ARGS) \
+		--output $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_prefix.json
+
+eval-rag-v4-child:  ## v4 消融 3：H3 child 检索
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_child \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_child.sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag $(V4_EVAL_ARGS) \
+		--output $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_child.json
+
+eval-rag-v4-parent:  ## v4 消融 4：child retrieval + H2 parent context
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_child RAG_PARENT_CONTEXT=true \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_parent.sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag $(V4_EVAL_ARGS) \
+		--output $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_parent.json
+
+eval-rag-v4-adaptive:  ## v4 自适应路由（V4_SECTION_PRIOR=0.05/0.10/0.15）
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_child \
+		RAG_PARENT_CONTEXT=true RAG_QUERY_ROUTING=true RAG_SECTION_PRIOR=$(V4_SECTION_PRIOR) \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_adaptive_$(V4_SECTION_PRIOR).sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag $(V4_EVAL_ARGS) \
+		--output $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_adaptive_$(V4_SECTION_PRIOR).json
+
+eval-rag-v4-priors:  ## 运行 section prior 0.05/0.10/0.15 消融
+	$(MAKE) eval-rag-v4-adaptive V4_SECTION_PRIOR=0.05
+	$(MAKE) eval-rag-v4-adaptive V4_SECTION_PRIOR=0.10
+	$(MAKE) eval-rag-v4-adaptive V4_SECTION_PRIOR=0.15
+
+eval-rag-v4-ablation: eval-rag-v4-clean-cache index-rag-v4-basic index-rag-v4-raw index-rag-v4-prefix index-rag-v4-child  ## 完整 v4 单变量消融
+	$(MAKE) eval-rag-v4-basic
+	$(MAKE) eval-rag-v4-raw
+	$(MAKE) eval-rag-v4-prefix
+	$(MAKE) eval-rag-v4-child
+	$(MAKE) eval-rag-v4-parent
+	$(MAKE) eval-rag-v4-priors
+
+eval-rag-v4-ablation-resume: eval-rag-v4-clean-cache index-rag-v4-raw index-rag-v4-prefix index-rag-v4-child  ## Basic 已成功时从 Enhanced 继续
+	$(MAKE) eval-rag-v4-basic
+	$(MAKE) eval-rag-v4-raw
+	$(MAKE) eval-rag-v4-prefix
+	$(MAKE) eval-rag-v4-child
+	$(MAKE) eval-rag-v4-parent
+	$(MAKE) eval-rag-v4-priors
+
+eval-rag-v4-gate:  ## 检查 dev 质量、分类退化和 P95 延迟门禁
+	.venv/bin/python -m tests.evaluation.check_rag_v4_gate \
+		--baseline $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_raw.json \
+		--candidate $(EVAL_OUTPUT_DIR)/eval_enhanced_dev_v4_adaptive_$(V4_SECTION_PRIOR).json
+
+eval-rag-v4-test: eval-rag-v4-gate  ## dev 达标后，仅运行一次冻结 test 与生成评估
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_child \
+		RAG_PARENT_CONTEXT=true RAG_QUERY_ROUTING=true RAG_SECTION_PRIOR=$(V4_SECTION_PRIOR) \
+		EVAL_JUDGE_CACHE_PATH=$(EVAL_OUTPUT_DIR)/judge_cache_v4_test.sqlite \
+		.venv/bin/python -m tests.evaluation.evaluate_rag --split test \
+		--retrieval-metrics minimal --ragas-max-workers 4 --with-generation \
+		--generation-metrics full --output $(EVAL_OUTPUT_DIR)/eval_enhanced_test_v4_final.json
+	$(V4_EVAL_ENV) ENHANCED_COLLECTION_NAME=biz_enhanced_v4_child \
+		RAG_PARENT_CONTEXT=true RAG_QUERY_ROUTING=true RAG_SECTION_PRIOR=$(V4_SECTION_PRIOR) \
+		.venv/bin/python -m tests.evaluation.evaluate_generation --split test \
+		--output $(EVAL_OUTPUT_DIR)/generation_enhanced_test_v4_final.json
+	.venv/bin/python -m tests.evaluation.check_rag_v4_gate --stage final \
+		--candidate $(EVAL_OUTPUT_DIR)/eval_enhanced_test_v4_final.json \
+		--generation $(EVAL_OUTPUT_DIR)/generation_enhanced_test_v4_final.json
 
 eval-rag-full:  ## 运行完整 RAG 评估（检索 + 生成 + correctness）
 	@echo "$(YELLOW)🧪 运行完整 RAG 评估 (mode=$(EVAL_RAG_MODE), 含生成评估)...$(NC)"

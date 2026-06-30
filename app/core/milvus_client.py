@@ -60,6 +60,11 @@ class MilvusClientManager:
         self._collection: Collection | None = None
         self._enhanced_collection: Collection | None = None  # Phase 2 集合句柄
 
+    @property
+    def enhanced_collection_name(self) -> str:
+        """Return the configured enhanced collection used for A/B indexes."""
+        return config.enhanced_collection_name or self.ENHANCED_COLLECTION_NAME
+
     def connect(self) -> MilvusClient:
         """
         连接到 Milvus 服务器并初始化 collection
@@ -155,19 +160,19 @@ class MilvusClientManager:
 
     def _enhanced_collection_exists(self) -> bool:
         """检查 biz_enhanced collection 是否存在"""
-        result = utility.has_collection(self.ENHANCED_COLLECTION_NAME)
+        result = utility.has_collection(self.enhanced_collection_name)
         return bool(result)  # type: ignore[arg-type]
 
     def _init_enhanced_collection(self) -> None:
         """初始化 biz_enhanced collection（幂等）"""
         try:
             if not self._enhanced_collection_exists():
-                logger.info(f"collection '{self.ENHANCED_COLLECTION_NAME}' 不存在，正在创建...")
+                logger.info(f"collection '{self.enhanced_collection_name}' 不存在，正在创建...")
                 self._create_enhanced_collection()
-                logger.info(f"成功创建 collection '{self.ENHANCED_COLLECTION_NAME}'")
+                logger.info(f"成功创建 collection '{self.enhanced_collection_name}'")
             else:
-                logger.info(f"collection '{self.ENHANCED_COLLECTION_NAME}' 已存在")
-                self._enhanced_collection = Collection(self.ENHANCED_COLLECTION_NAME)
+                logger.info(f"collection '{self.enhanced_collection_name}' 已存在")
+                self._enhanced_collection = Collection(self.enhanced_collection_name)
 
             self._load_enhanced_collection()
         except Exception as e:
@@ -231,7 +236,7 @@ class MilvusClientManager:
         )
 
         self._enhanced_collection = Collection(
-            name=self.ENHANCED_COLLECTION_NAME,
+            name=self.enhanced_collection_name,
             schema=schema,
             num_shards=self.DEFAULT_SHARD_NUMBER,
         )
@@ -269,24 +274,24 @@ class MilvusClientManager:
     def _load_enhanced_collection(self) -> None:
         """加载 biz_enhanced collection 到内存"""
         if self._enhanced_collection is None:
-            self._enhanced_collection = Collection(self.ENHANCED_COLLECTION_NAME)
+            self._enhanced_collection = Collection(self.enhanced_collection_name)
 
         try:
-            load_state = utility.load_state(self.ENHANCED_COLLECTION_NAME)
+            load_state = utility.load_state(self.enhanced_collection_name)
             state_name = getattr(load_state, "name", str(load_state))
             if state_name != "Loaded":
                 self._enhanced_collection.load()
-                logger.info(f"成功加载 collection '{self.ENHANCED_COLLECTION_NAME}'")
+                logger.info(f"成功加载 collection '{self.enhanced_collection_name}'")
             else:
-                logger.info(f"Collection '{self.ENHANCED_COLLECTION_NAME}' 已加载")
+                logger.info(f"Collection '{self.enhanced_collection_name}' 已加载")
         except AttributeError:
             try:
                 self._enhanced_collection.load()
-                logger.info(f"成功加载 collection '{self.ENHANCED_COLLECTION_NAME}'")
+                logger.info(f"成功加载 collection '{self.enhanced_collection_name}'")
             except MilvusException as e:
                 error_msg = str(e).lower()
                 if "already loaded" in error_msg or "loaded" in error_msg:
-                    logger.info(f"Collection '{self.ENHANCED_COLLECTION_NAME}' 已加载")
+                    logger.info(f"Collection '{self.enhanced_collection_name}' 已加载")
                 else:
                     raise
         except Exception as e:

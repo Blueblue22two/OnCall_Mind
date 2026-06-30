@@ -1,9 +1,9 @@
 """向量索引服务模块"""
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from loguru import logger
 from pypdf import PdfReader
@@ -203,19 +203,33 @@ class VectorIndexService:
             vector_store_manager.delete_by_source(normalized_path)
 
             # 3. 使用新的文档分割器
-            documents = document_splitter_service.split_document(content, normalized_path)
-            logger.info(f"文档分割完成: {file_path} -> {len(documents)} 个分片")
-            result.chunks_count = len(documents)
+            basic_documents = document_splitter_service.split_document(
+                content,
+                normalized_path,
+                strategy="legacy",
+                include_section_prefix=False,
+            )
+            enhanced_documents = document_splitter_service.split_document(
+                content,
+                normalized_path,
+                strategy=config.rag_chunk_strategy,
+                include_section_prefix=config.rag_include_section_prefix,
+            )
+            logger.info(
+                f"文档分割完成: {file_path} -> basic={len(basic_documents)}, "
+                f"enhanced={len(enhanced_documents)}"
+            )
+            result.chunks_count = len(enhanced_documents)
 
-            if not documents:
+            if not basic_documents:
                 logger.warning(f"文件内容为空或无法分割: {file_path}")
                 return result
 
             # 4. 写入基础 biz collection（所有模式都写）
             try:
-                vector_store_manager.add_documents(documents)
+                vector_store_manager.add_documents(basic_documents)
                 result.basic_index_status = "success"
-                logger.info(f"[Basic] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
+                logger.info(f"[Basic] 文件索引完成: {file_path}, 共 {len(basic_documents)} 个分片")
             except Exception as e:
                 result.basic_index_status = "failed"
                 result.basic_index_error = str(e)
@@ -228,15 +242,15 @@ class VectorIndexService:
                     enhanced_vector_store_manager,
                 )
                 enhanced_vector_store_manager.delete_by_source(normalized_path)
-                enhanced_vector_store_manager.add_documents(documents)
+                enhanced_vector_store_manager.add_documents(enhanced_documents)
                 result.enhanced_index_status = "success"
-                logger.info(f"[Enhanced] 文件索引完成: {file_path}, 共 {len(documents)} 个分片")
+                logger.info(f"[Enhanced] 文件索引完成: {file_path}, 共 {len(enhanced_documents)} 个分片")
             except Exception as e:
                 result.enhanced_index_status = "failed"
                 result.enhanced_index_error = str(e)
                 logger.warning(
                     f"[Enhanced] 文件写入失败（不影响基础检索）: {e}"
-                    f" | file={file_path}, chunks={len(documents)}"
+                    f" | file={file_path}, chunks={len(enhanced_documents)}"
                 )
 
             return result

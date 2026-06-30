@@ -129,6 +129,13 @@ RERANKER_MODEL=BAAI/bge-reranker-v2-m3
 RERANKER_TOP_K=3
 RERANK_COARSE_TOP_K=10
 
+# v4 RAG 实验开关（默认关闭；先通过 make eval-rag-v4-ablation 验证）
+RAG_QUERY_ROUTING=false
+RAG_CHUNK_STRATEGY=legacy
+RAG_INCLUDE_SECTION_PREFIX=false
+RAG_PARENT_CONTEXT=false
+ENHANCED_COLLECTION_NAME=biz_enhanced
+
 # Redis 可选；不配置时使用进程内 MemorySaver
 REDIS_URL=redis://localhost:6379
 
@@ -141,6 +148,7 @@ EVAL_JUDGE_MODEL=qwen3.5-plus
 EVAL_JUDGE_TEMPERATURE=0.0
 EVAL_JUDGE_API_BASE=
 EVAL_JUDGE_API_KEY=
+EVAL_JUDGE_CACHE_PATH=reports/judge_cache.sqlite
 ```
 
 > **注意** !!! 如果各位用户部署该项目时，不要把真实 API Key 提交到代码仓库避免API KEY泄露。

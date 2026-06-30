@@ -56,14 +56,6 @@ class CrossEncoderReranker(BaseReranker):
             self.last_scores = []
             return []
 
-        if len(documents) <= top_k:
-            logger.debug(
-                f"[Reranker:cross_encoder] 候选数({len(documents)}) <= top_k({top_k})，跳过精排"
-            )
-            # 当候选数不足时，给每个文档一个占位分数（保持接口一致）
-            self.last_scores = [(1.0, doc) for doc in documents]
-            return documents
-
         try:
             model = self._get_model()
 
@@ -86,6 +78,7 @@ class CrossEncoderReranker(BaseReranker):
             return reranked
 
         except Exception as e:
-            logger.error(f"[Reranker:cross_encoder] 精排失败，回退到截断: {e}")
-            self.last_scores = []  # 失败时清空分数
-            return documents[:top_k]
+            logger.error(f"[Reranker:cross_encoder] 精排失败: {e}")
+            self.last_scores = []
+            # 由 EnhancedRAGRetriever 统一执行并记录 coarse fallback。
+            raise RuntimeError(f"CrossEncoder 精排失败: {e}") from e

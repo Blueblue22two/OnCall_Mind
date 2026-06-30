@@ -391,6 +391,7 @@ async def run_generation_evaluation(
     sample_size: Optional[int] = None,
     skip_llm_judge: bool = False,
     skip_custom_judge: bool = False,
+    split: str = "all",
 ) -> dict[str, Any]:
     """执行完整的 RAG 生成质量评估。
 
@@ -400,6 +401,7 @@ async def run_generation_evaluation(
         sample_size: 可选，仅评估前 N 条（0 表示全部，调试用）。
         skip_llm_judge: 跳过 RAGAs LLM Judge 指标（faithfulness 等）。
         skip_custom_judge: 跳过自定义 LLM Judge 指标（completeness 等）。
+        split: 数据集划分（train/dev/test/all）。
 
     Returns:
         dict: 完整评估结果。
@@ -409,7 +411,8 @@ async def run_generation_evaluation(
     from tests.evaluation.rag_testset import (
         DATASET_VERSION,
         EVALUATION_DATASET,
-        get_eval_dataset,
+        _build_dataset_from_samples,
+        split_dataset,
         validate_testset,
     )
 
@@ -421,12 +424,17 @@ async def run_generation_evaluation(
             logger.error(f"  - {e}")
         sys.exit(1)
 
-    # 应用 sample_size 限制
-    if sample_size and sample_size > 0:
-        dataset_samples = EVALUATION_DATASET[:sample_size]
-        logger.info(f"数据集采样: {sample_size}/{len(EVALUATION_DATASET)} 条")
+    if split == "all":
+        dataset_samples = list(EVALUATION_DATASET)
     else:
-        dataset_samples = EVALUATION_DATASET
+        train, dev, test = split_dataset(EVALUATION_DATASET)
+        dataset_samples = {"train": train, "dev": dev, "test": test}[split]
+        logger.info(f"数据集划分: split='{split}', samples={len(dataset_samples)}")
+
+    # 在 split 之后应用 sample_size，避免调试采样改变冻结集合语义。
+    if sample_size and sample_size > 0:
+        dataset_samples = dataset_samples[:sample_size]
+        logger.info(f"数据集采样: {len(dataset_samples)} 条")
 
     total = len(dataset_samples)
     logger.info(f"数据集校验通过: {total} 条样本, version={DATASET_VERSION}")
@@ -459,20 +467,12 @@ async def run_generation_evaluation(
     await rag_agent_service._initialize_agent()
 
     # 2. 加载测试集并准备数据
-    testset = get_eval_dataset()
-    if sample_size and sample_size > 0:
-        # 对 Dataset 也进行采样
-        from datasets import Dataset
-        testset = Dataset.from_dict({
-            k: v[:sample_size] for k, v in testset.to_dict().items()
-        })
+    testset = _build_dataset_from_samples(dataset_samples)
 
     questions = testset["question"]
     ground_truths = testset["ground_truth"]
     categories = testset["category"]
     gen_expected_facts_list = testset["gen_expected_facts"]
-    gen_forbidden_list = testset["gen_forbidden_content"]
-    gen_min_length_list = testset["gen_min_length"]
     relevant_docs_list = testset["relevant_docs"]
 
     # 3. 构建 Judge LLM
@@ -639,15 +639,21 @@ async def run_generation_evaluation(
     low_quality_samples = []
     for s in per_question:
         low_flags = []
-        for metric, config in LOW_THRESHOLDS.items():
+        for metric, threshold_config in LOW_THRESHOLDS.items():
             val = s.get(metric)
             if val is None:
                 continue
-            threshold = config["threshold"]
-            if config["comparison"] == "gt" and val > threshold:
-                low_flags.append(f"{metric}={val:.2f}>{threshold:.2f}(P{config['percentile']})")
-            elif config["comparison"] == "lt" and val < threshold:
-                low_flags.append(f"{metric}={val:.2f}<{threshold:.2f}(P{config['percentile']})")
+            threshold = threshold_config["threshold"]
+            if threshold_config["comparison"] == "gt" and val > threshold:
+                low_flags.append(
+                    f"{metric}={val:.2f}>{threshold:.2f}"
+                    f"(P{threshold_config['percentile']})"
+                )
+            elif threshold_config["comparison"] == "lt" and val < threshold:
+                low_flags.append(
+                    f"{metric}={val:.2f}<{threshold:.2f}"
+                    f"(P{threshold_config['percentile']})"
+                )
 
         if low_flags:
             low_quality_samples.append({
@@ -676,6 +682,7 @@ async def run_generation_evaluation(
         },
         "evaluated_at": datetime.now().isoformat(),
         "dataset_version": DATASET_VERSION,
+        "split": split,
         "judge": judge_meta,
         "aggregate_metrics": aggregate_metrics,
         "category_breakdown": category_breakdown,
@@ -689,21 +696,21 @@ async def run_generation_evaluation(
     logger.info(f"  样本数:           {total}")
     logger.info(f"  成功率:           {success_rate:.2%} ({success_count}/{total})")
     logger.info(f"  平均延迟:         {agg_latency:.0f} ms")
-    logger.info(f"  --- RAGAs 指标 ---")
+    logger.info("  --- RAGAs 指标 ---")
     if agg_faithfulness is not None:
         logger.info(f"  faithfulness:      {agg_faithfulness:.4f}  (目标 ≥ 0.75)")
     if agg_relevancy is not None:
         logger.info(f"  answer_relevancy:  {agg_relevancy:.4f}  (目标 ≥ 0.70)")
     if agg_correctness is not None:
         logger.info(f"  answer_correctness:{agg_correctness:.4f}  (目标 ≥ 0.65)")
-    logger.info(f"  --- 自定义 Judge 指标 ---")
+    logger.info("  --- 自定义 Judge 指标 ---")
     if agg_completeness is not None:
         logger.info(f"  answer_completeness:{agg_completeness:.2f}  (目标 ≥ 1.0, 满分 2.0)")
     if agg_hallucination is not None:
         logger.info(f"  hallucination_score:{agg_hallucination:.2f}  (目标 ≥ 1.5, 满分 2.0)")
-    logger.info(f"  --- 非 LLM 指标 ---")
+    logger.info("  --- 非 LLM 指标 ---")
     logger.info(f"  semantic_similarity:{agg_semantic_sim:.4f}")
-    logger.info(f"  --- 分类统计 ---")
+    logger.info("  --- 分类统计 ---")
     for cat, info in category_breakdown.items():
         logger.info(f"    {cat}: {info['count']} 题")
     if low_quality_samples:
@@ -833,6 +840,12 @@ if __name__ == "__main__":
         default=False,
         help="跳过自定义 LLM Judge 指标（answer_completeness, hallucination_score）",
     )
+    parser.add_argument(
+        "--split",
+        choices=["train", "dev", "test", "all"],
+        default="all",
+        help="数据集划分 (default: all)",
+    )
     args = parser.parse_args()
 
     asyncio.run(
@@ -842,5 +855,6 @@ if __name__ == "__main__":
             sample_size=args.sample_size,
             skip_llm_judge=args.skip_llm_judge,
             skip_custom_judge=args.skip_custom_judge,
+            split=args.split,
         )
     )

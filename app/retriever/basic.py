@@ -42,6 +42,9 @@ class BasicRAGRetriever(BaseRAGRetriever):
                 "rank": rank,
                 "score": None,  # Basic 模式无精排分数
                 "selected": True,
+                "selected_in_pool": True,
+                "selected_in_context": False,
+                "output_rank": rank,
                 "truncation_reason": None,
                 "file_name": metadata.get("_file_name", metadata.get("_source", "")),
                 "source": metadata.get("_source", ""),
@@ -49,6 +52,7 @@ class BasicRAGRetriever(BaseRAGRetriever):
                 "h2": metadata.get("h2", "") or "",
                 "h3": metadata.get("h3", "") or "",
                 "content_preview": doc.page_content[:Content_PREVIEW_LEN].replace("\n", " "),
+                "chunk_id": metadata.get("chunk_id", ""),
             })
 
         self.last_retrieval_meta = {
