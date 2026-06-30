@@ -34,10 +34,20 @@ OnCall Mind 是一个基于 FastAPI、LangChain、LangGraph 和 Milvus 的智能
 
 系统支持两种检索模式：
 
-- `basic`：基于 Dense Embedding 的向量检索。
-- `enhanced`：查询预处理 + Dense / BM25 混合检索 + RRF 融合 + Cross-Encoder 精排。
+- **`basic`**：基于 Dense Embedding 的向量检索（Milvus L2 距离），返回 Top-K 文档。
+- **`enhanced`**：Query Rewrite（可选）→ Dense + BM25 Hybrid Search → RRF 融合 → Cross-Encoder Rerank → Top-K，支持原始 query 双路召回和精排失败降级。
 
-知识库文档默认放在 `aiops-docs/` 目录，包含常见运维故障排查 SOP。
+v4 增强特性（通过实验开关逐项启用）：
+
+| 特性 | 配置项 | 说明 |
+|---|---|---|
+| Section-child 分块 | `RAG_CHUNK_STRATEGY=section_child` | H3 子节粒度分块，替代旧 FAQ 平铺分块 |
+| Parent 上下文回填 | `RAG_PARENT_CONTEXT=true` | chunk 携带 H2 父节标题提升语义完整性 |
+| 查询路由 | `RAG_QUERY_ROUTING=true` | cross-doc → Top-K=5，其他 → Top-K=3 |
+| 条件多样性 | `RAG_DIVERSITY_SCORE_MARGIN=0.15` + `RAG_MAX_CHUNKS_PER_FILE=2` | 仅在分数支撑时扩展来源文件覆盖 |
+| 节标题先验 | `RAG_SECTION_PRIOR=0.10` | CrossEncoder 打分时注入节标题语义先验 |
+
+知识库文档默认放在 `aiops-docs/` 目录，包含 CPU/内存/磁盘/网络/服务不可用/缓存/消息队列等 15 类常见运维故障排查 SOP。
 
 ### 2. AIOps 诊断
 
@@ -65,10 +75,14 @@ AIOps 诊断基于 Plan-Execute-Replan 流程：
 
 评估脚本位于 `tests/evaluation/`：
 
-- `evaluate_rag.py`：RAG 检索与生成质量评估。
+- `evaluate_rag.py`：RAG 检索与生成两阶段评估（主脚本）。
+- `evaluate_generation.py`：生成质量独立评估。
 - `evaluate_agent.py`：RAG Agent 工具调用与目标达成评估。
 - `evaluate_aiops_agent.py`：AIOps 诊断流程评估。
 - `run_ablation.py`：RAG 消融实验。
+- `check_rag_v4_gate.py`：v4 门禁检查（CP/CR/分类退化/延迟）。
+- `index_rag_variant.py`：RAG 索引变体管理（basic/raw/prefix/child）。
+- `metrics/retrieval_coverage.py`：文档级/section 级覆盖指标。
 
 ## 项目结构
 
@@ -126,14 +140,23 @@ RAG_TOP_K=3
 QUERY_PREPROCESSOR_TYPE=none
 RERANKER_TYPE=cross_encoder
 RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_MODEL_PATH=./models/BAAI/bge-reranker-v2-m3  # 本地模型路径，优先于 HF 下载
 RERANKER_TOP_K=3
 RERANK_COARSE_TOP_K=10
+RAG_DIVERSIFY_BY_FILE=false
+RAG_DIVERSIFY_CANDIDATE_MULTIPLIER=3
 
-# v4 RAG 实验开关（默认关闭；先通过 make eval-rag-v4-ablation 验证）
+# v4 RAG 实验开关（默认关闭；完整验证命令见 make eval-rag-v4-ablation）
 RAG_QUERY_ROUTING=false
+RAG_CROSS_DOC_TOP_K=5
 RAG_CHUNK_STRATEGY=legacy
 RAG_INCLUDE_SECTION_PREFIX=false
 RAG_PARENT_CONTEXT=false
+RAG_PARENT_CONTEXT_MAX_CHARS=2400
+RAG_PARENT_CONTEXT_MAX_TOKENS=3000
+RAG_SECTION_PRIOR=0.10
+RAG_DIVERSITY_SCORE_MARGIN=0.15
+RAG_MAX_CHUNKS_PER_FILE=2
 ENHANCED_COLLECTION_NAME=biz_enhanced
 
 # Redis 可选；不配置时使用进程内 MemorySaver
@@ -143,8 +166,8 @@ REDIS_URL=redis://localhost:6379
 MCP_CLS_URL=http://localhost:8003/mcp
 MCP_MONITOR_URL=http://localhost:8004/mcp
 
-# 评估 Judge 配置，可选
-EVAL_JUDGE_MODEL=qwen3.5-plus
+# 评估 Judge 配置（日常迭代用 qwen-turbo，最终基线用 qwen3.5-plus）
+EVAL_JUDGE_MODEL=qwen-turbo
 EVAL_JUDGE_TEMPERATURE=0.0
 EVAL_JUDGE_API_BASE=
 EVAL_JUDGE_API_KEY=
@@ -338,11 +361,14 @@ pip install modelscope
 modelscope download BAAI/bge-reranker-v2-m3 --local_dir ./models/BAAI/bge-reranker-v2-m3
 ```
 
-下载完成后，在 `.env` 中将模型路径指向本地目录：
+下载完成后，在 `.env` 中配置本地模型路径（`RERANKER_MODEL` 保留 HF 名称作为 fallback）：
 
 ```bash
-RERANKER_MODEL=./models/BAAI/bge-reranker-v2-m3
+RERANKER_MODEL=BAAI/bge-reranker-v2-m3
+RERANKER_MODEL_PATH=./models/BAAI/bge-reranker-v2-m3
 ```
+
+> `RERANKER_MODEL_PATH` 非空时系统优先从本地加载；为空时 `sentence-transformers` 使用 `RERANKER_MODEL` 名称从 HuggingFace 自动下载。
 
 **方法二：Python 脚本下载**
 
@@ -407,21 +433,68 @@ curl -X POST "http://localhost:9900/api/aiops" \
 
 ## 评估命令
 
+> **评估数据集**：`tests/evaluation/rag_testset.py` v1.4.0，104 条手工构建 + LLM 辅助生成的 Q&A 样本。
+> 按 category 分层划分为 train=58 / dev=25 / test=21（seed=42）。
+> 涵盖 exact_keyword、colloquial、cross_doc、edge_case 四类问题。
+> test split 冻结，仅在方案通过 dev 门禁后运行一次。
+
+### RAG 检索评估
+
 ```bash
-# RAG 检索评估
-python -m tests.evaluation.evaluate_rag
+# Basic 模式（默认，快速验证）
+RAG_MODE=basic .venv/bin/python3 -m tests.evaluation.evaluate_rag \
+  --split dev --retrieval-metrics minimal \
+  --output reports/eval_basic_dev.json
 
-# RAG 检索 + 生成评估
-python -m tests.evaluation.evaluate_rag --with-generation
+# Enhanced 模式（CrossEncoder 精排，默认 qwen-turbo Judge + 缓存）
+RAG_MODE=enhanced \
+QUERY_PREPROCESSOR_TYPE=rewrite \
+RERANKER_TYPE=cross_encoder \
+.venv/bin/python3 -m tests.evaluation.evaluate_rag \
+  --split dev --retrieval-metrics minimal \
+  --output reports/eval_enhanced_dev.json
 
-# RAG 消融实验
-python -m tests.evaluation.run_ablation
+# Enhanced + 生成评估（含 faithfulness、answer_relevancy、answer_correctness）
+RAG_MODE=enhanced \
+QUERY_PREPROCESSOR_TYPE=rewrite \
+RERANKER_TYPE=cross_encoder \
+.venv/bin/python3 -m tests.evaluation.evaluate_rag \
+  --split dev --retrieval-metrics minimal \
+  --with-generation --generation-metrics full \
+  --output reports/eval_enhanced_dev_full.json
 
-# Agent 工具调用评估
-python -m tests.evaluation.evaluate_agent --skip-goal
+# 最终基线（qwen3.5-plus Judge，确保评估质量）
+EVAL_JUDGE_MODEL=qwen3.5-plus \
+RAG_MODE=enhanced \
+QUERY_PREPROCESSOR_TYPE=rewrite \
+RERANKER_TYPE=cross_encoder \
+.venv/bin/python3 -m tests.evaluation.evaluate_rag \
+  --split dev --retrieval-metrics minimal \
+  --output reports/eval_enhanced_final_baseline.json
+```
 
-# AIOps 诊断流程评估
-python -m tests.evaluation.evaluate_aiops_agent
+### v4 消融实验（Makefile 快捷命令）
+
+```bash
+make eval-rag-v4-ablation          # 完整 v4 消融（raw → prefix → child → parent → adaptive × 3 priors）
+make eval-rag-v4-gate              # 检查最优方案是否通过 dev 门禁
+make eval-rag-v4-test              # 在冻结 test split 上跑最终基线
+make eval-rag-v4-clean-cache       # 清理 Judge 缓存，强制重新评分
+```
+
+### 其他评估
+
+```bash
+make eval-rag                      # RAG 检索评估（通过 EVAL_RAG_MODE 切换 basic/enhanced）
+make eval-rag-full                 # RAG 检索 + 生成评估
+make eval-generation               # 生成质量独立评估
+make eval-compare                  # 对比 basic vs enhanced
+make eval-ablation                 # 通用消融实验
+make eval-validate-dataset         # 验证数据集质量
+
+# Agent / AIOps 评估
+.venv/bin/python3 -m tests.evaluation.evaluate_agent --skip-goal
+.venv/bin/python3 -m tests.evaluation.evaluate_aiops_agent
 ```
 
 ## 常用开发命令
